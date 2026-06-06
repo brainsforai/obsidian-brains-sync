@@ -5,14 +5,14 @@ Bidirectional sync between your [Obsidian](https://obsidian.md) vault and a [Bra
 ## Features
 
 - **Pull from Brains** — fetches all wiki pages via the Brains API and writes them into a configurable vault subfolder (`brains/` by default).
-- **Push to Brains** — scans the vault subfolder for markdown files and PATCHes each one back to your Brains instance.
+- **Push to Brains** — scans the vault subfolder for markdown files and syncs each one back (updates existing pages, creates new ones).
 - **Remote-wins** on pull (V1): pulling always overwrites local copies with the server version.
 - **Sync log** — a sidebar Notice summarises every operation and logs details to the developer console.
 
 ## Requirements
 
 - Obsidian ≥ 1.4.0 (desktop only)
-- A running [Brains](https://usebrains.app) instance with an API key
+- A [Brains](https://usebrains.app) account (sign in with **Connect to Brains** — no manual token needed)
 
 ## Installation
 
@@ -20,7 +20,6 @@ Bidirectional sync between your [Obsidian](https://obsidian.md) vault and a [Bra
 
 1. Build the plugin:
    ```bash
-   cd obsidian-plugin
    npm install
    npm run build
    ```
@@ -36,15 +35,16 @@ Once listed, search for **Brains Sync** in **Settings → Community Plugins → 
 
 ## Configuration
 
-Open **Settings → Brains Sync** and fill in:
+Open **Settings → Brains Sync**:
 
 | Field | Description | Default |
 |---|---|---|
 | Brains instance URL | Base URL of your Brains deployment | `https://lets.usebrains.app` |
-| API key | Your Brains API key (stored in Obsidian SecretStorage) | — |
+| Account | **Connect to Brains** — one-click OAuth2 sign-in | — |
 | Vault folder | Subfolder where pages are synced | `brains` |
+| API token (Advanced) | Optional Personal Access Token fallback for self-hosters | — |
 
-The API key is stored via Obsidian's `SecretStorage` and is **never** written to `data.json` or the vault.
+Click **Connect to Brains** to sign in: your browser opens the Brains login, you approve, and Obsidian receives the access token automatically. Tokens (and any fallback PAT) are stored via Obsidian's `SecretStorage` and are **never** written to `data.json` or the vault.
 
 ## Usage
 
@@ -59,11 +59,13 @@ All pages are fetched from `GET /api/v1/pages` and written to `<vault-folder>/<p
 
 - Open the Command Palette → **Brains Sync: Push to Brains**
 
-Every `.md` file under `<vault-folder>/` is read and sent via `PATCH /api/v1/page`.
+Every `.md` file under `<vault-folder>/` is read and synced back: existing pages are updated with a full-rewrite `PUT /api/v1/page`, and new pages are created with `POST /api/v1/pages`.
 
 ## Auth
 
-All HTTP requests use the `x-api-key: <key>` header. No OAuth flow is required for V1.
+Sign-in uses **OAuth 2.0 with PKCE** (authorization-code flow). Click **Connect to Brains**, approve in the browser, and the plugin exchanges the code for an access token + refresh token; the access token is refreshed automatically before it expires. All API requests send `Authorization: Bearer <token>`.
+
+For self-hosted servers or non-OAuth setups, an optional **Personal Access Token** can be entered under **Settings → Brains Sync → Advanced**.
 
 ## License
 

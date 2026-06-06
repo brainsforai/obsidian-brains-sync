@@ -15,12 +15,36 @@ import {
 interface BrainsSettings {
   instanceUrl: string;
   vaultFolder: string;
+  // OAuth2/PKCE state (non-secret; tokens live in SecretStorage).
+  oauthClientId?: string;
+  tokenExpiresAt?: number; // epoch ms when the access token should be refreshed
 }
 
 const DEFAULT_SETTINGS: BrainsSettings = {
   instanceUrl: "https://lets.usebrains.app",
   vaultFolder: "brains",
 };
+
+// OAuth2 + PKCE constants. The redirect uses Obsidian's custom URI scheme so the
+// authorization server can hand the code back to this plugin on desktop.
+const OAUTH_PROTOCOL_ACTION = "brains-sync-auth";
+const OAUTH_REDIRECT_URI = `obsidian://${OAUTH_PROTOCOL_ACTION}`;
+const OAUTH_SCOPE = "wiki.read wiki.write";
+
+// SecretStorage keys.
+const SECRET_PAT = "brains-api-key";
+const SECRET_ACCESS = "brains-access-token";
+const SECRET_REFRESH = "brains-refresh-token";
+
+interface BrainsTokenResponse {
+  access_token?: string;
+  refresh_token?: string;
+  expires_in?: number;
+  token_type?: string;
+  scope?: string;
+  error?: string;
+  error_description?: string;
+}
 
 interface BrainsPage {
   name: string;
@@ -52,6 +76,33 @@ interface SecretStorageLike {
 }
 
 // ---------------------------------------------------------------------------
+// PKCE helpers (Web Crypto — available in Obsidian's Electron runtime)
+// ---------------------------------------------------------------------------
+
+/** base64url-encode bytes with no padding (RFC 7636). */
+function base64UrlEncode(bytes: Uint8Array): string {
+  let str = "";
+  for (const b of bytes) str += String.fromCharCode(b);
+  return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** A URL-safe random string from `byteLength` random bytes (~1.33x chars). */
+function randomUrlSafe(byteLength: number): string {
+  const arr = new Uint8Array(byteLength);
+  crypto.getRandomValues(arr);
+  return base64UrlEncode(arr);
+}
+
+/** S256 PKCE challenge: base64url(sha256(verifier)). */
+async function pkceChallenge(verifier: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(verifier),
+  );
+  return base64UrlEncode(new Uint8Array(digest));
+}
+
+// ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
 
@@ -80,9 +131,25 @@ export default class BrainsPlugin extends Plugin {
       callback: () => this.pushToBrains(),
     });
 
+    // Command: Connect to Brains (OAuth2 + PKCE sign-in)
+    this.addCommand({
+      id: "connect-to-brains",
+      name: "Connect to Brains (sign in)",
+      callback: () => this.startOAuthConnect(),
+    });
+
+    // Handle the OAuth redirect back into Obsidian (obsidian://brains-sync-auth).
+    this.registerObsidianProtocolHandler(OAUTH_PROTOCOL_ACTION, (params) => {
+      void this.handleOAuthCallback(params as Record<string, string>);
+    });
+
     // Settings tab
     this.addSettingTab(new BrainsSettingTab(this.app, this));
   }
+
+  // In-memory PKCE state for an in-progress authorization (not persisted; a
+  // mid-flow plugin reload simply requires re-clicking Connect).
+  private pendingAuth: { verifier: string; state: string } | null = null;
 
   // -------------------------------------------------------------------------
   // Settings persistence
@@ -109,11 +176,206 @@ export default class BrainsPlugin extends Plugin {
   }
 
   async getApiKey(): Promise<string | null> {
-    return (await this.secretStorage()?.retrieve("brains-api-key")) ?? null;
+    return (await this.secretStorage()?.retrieve(SECRET_PAT)) ?? null;
   }
 
   async storeApiKey(key: string): Promise<void> {
-    await this.secretStorage()?.store("brains-api-key", key);
+    await this.secretStorage()?.store(SECRET_PAT, key);
+  }
+
+  // -------------------------------------------------------------------------
+  // OAuth2 + PKCE
+  // -------------------------------------------------------------------------
+
+  /** True if an OAuth access token is currently stored. */
+  async isConnected(): Promise<boolean> {
+    return !!(await this.secretStorage()?.retrieve(SECRET_ACCESS));
+  }
+
+  /**
+   * Resolve the bearer token to use for API calls: a fresh OAuth access token
+   * (refreshing if it is near expiry) when connected, otherwise the manual PAT.
+   */
+  private async getAuthToken(): Promise<string | null> {
+    const secret = this.secretStorage();
+    const access = (await secret?.retrieve(SECRET_ACCESS)) ?? null;
+    if (access) {
+      const exp = this.settings.tokenExpiresAt ?? 0;
+      if (Date.now() >= exp) {
+        if (await this.refreshTokens()) {
+          return (await secret?.retrieve(SECRET_ACCESS)) ?? null;
+        }
+        // Refresh failed — fall through to the PAT fallback below.
+      } else {
+        return access;
+      }
+    }
+    return this.getApiKey();
+  }
+
+  /** Register a dynamic OAuth client once and cache the client_id in settings. */
+  private async ensureClientId(): Promise<string | null> {
+    if (this.settings.oauthClientId) return this.settings.oauthClientId;
+    try {
+      const resp = await requestUrl({
+        url: `${this.baseUrl()}/oauth/register`,
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        throw: false,
+        body: JSON.stringify({
+          redirect_uris: [OAUTH_REDIRECT_URI],
+          client_name: "Brains Sync (Obsidian)",
+        }),
+      } as RequestUrlParam);
+      if (resp.status !== 200 && resp.status !== 201) {
+        new Notice(`Brains: client registration failed (HTTP ${resp.status}).`);
+        return null;
+      }
+      const clientId = (resp.json as { client_id?: string })?.client_id;
+      if (!clientId) {
+        new Notice("Brains: registration returned no client_id.");
+        return null;
+      }
+      this.settings.oauthClientId = clientId;
+      await this.saveSettings();
+      return clientId;
+    } catch (err) {
+      new Notice(`Brains: registration error — ${(err as Error).message}`);
+      return null;
+    }
+  }
+
+  /** Begin the OAuth sign-in: build a PKCE challenge and open the browser. */
+  async startOAuthConnect(): Promise<void> {
+    if (!this.baseUrl()) {
+      new Notice("Brains: set the instance URL first.");
+      return;
+    }
+    const clientId = await this.ensureClientId();
+    if (!clientId) return;
+
+    const verifier = randomUrlSafe(32);
+    const state = randomUrlSafe(16);
+    const challenge = await pkceChallenge(verifier);
+    this.pendingAuth = { verifier, state };
+
+    const url =
+      `${this.baseUrl()}/oauth/authorize?response_type=code` +
+      `&client_id=${encodeURIComponent(clientId)}` +
+      `&redirect_uri=${encodeURIComponent(OAUTH_REDIRECT_URI)}` +
+      `&code_challenge=${encodeURIComponent(challenge)}` +
+      `&code_challenge_method=S256` +
+      `&scope=${encodeURIComponent(OAUTH_SCOPE)}` +
+      `&state=${encodeURIComponent(state)}`;
+
+    window.open(url, "_blank");
+    new Notice("Brains: complete sign-in in your browser, then return to Obsidian.");
+  }
+
+  /** Handle the obsidian://brains-sync-auth redirect and exchange the code. */
+  async handleOAuthCallback(params: Record<string, string>): Promise<void> {
+    if (params.error) {
+      new Notice(`Brains: sign-in failed — ${params.error_description ?? params.error}`);
+      return;
+    }
+    const pending = this.pendingAuth;
+    if (!pending || params.state !== pending.state) {
+      new Notice("Brains: sign-in state mismatch — please try Connect again.");
+      return;
+    }
+    if (!params.code) {
+      new Notice("Brains: no authorization code returned.");
+      return;
+    }
+    const clientId = this.settings.oauthClientId;
+    if (!clientId) {
+      new Notice("Brains: missing client_id — please try Connect again.");
+      return;
+    }
+
+    const form = new URLSearchParams({
+      grant_type: "authorization_code",
+      code: params.code,
+      redirect_uri: OAUTH_REDIRECT_URI,
+      client_id: clientId,
+      code_verifier: pending.verifier,
+    }).toString();
+
+    try {
+      const resp = await requestUrl({
+        url: `${this.baseUrl()}/oauth/token`,
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        throw: false,
+        body: form,
+      } as RequestUrlParam);
+      const json = resp.json as BrainsTokenResponse | null;
+      if (resp.status !== 200 || !json?.access_token) {
+        new Notice(
+          `Brains: token exchange failed — ${json?.error_description ?? json?.error ?? `HTTP ${resp.status}`}.`,
+        );
+        return;
+      }
+      await this.storeTokens(json);
+      new Notice("Brains: connected ✓");
+    } catch (err) {
+      new Notice(`Brains: token exchange error — ${(err as Error).message}`);
+    } finally {
+      this.pendingAuth = null;
+    }
+  }
+
+  /** Exchange a refresh token for a new access token. Returns success. */
+  private async refreshTokens(): Promise<boolean> {
+    const secret = this.secretStorage();
+    const refresh = (await secret?.retrieve(SECRET_REFRESH)) ?? null;
+    const clientId = this.settings.oauthClientId;
+    if (!refresh || !clientId) return false;
+
+    const form = new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refresh,
+      client_id: clientId,
+    }).toString();
+
+    try {
+      const resp = await requestUrl({
+        url: `${this.baseUrl()}/oauth/token`,
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        throw: false,
+        body: form,
+      } as RequestUrlParam);
+      const json = resp.json as BrainsTokenResponse | null;
+      if (resp.status !== 200 || !json?.access_token) {
+        // Refresh token is dead — clear it so the UI prompts a re-connect.
+        await this.clearTokens();
+        return false;
+      }
+      await this.storeTokens(json);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Persist access + refresh tokens and the refresh deadline (60s of slack). */
+  private async storeTokens(t: BrainsTokenResponse): Promise<void> {
+    const secret = this.secretStorage();
+    if (t.access_token) await secret?.store(SECRET_ACCESS, t.access_token);
+    if (t.refresh_token) await secret?.store(SECRET_REFRESH, t.refresh_token);
+    const ttl = typeof t.expires_in === "number" ? t.expires_in : 3600;
+    this.settings.tokenExpiresAt = Date.now() + Math.max(0, ttl - 60) * 1000;
+    await this.saveSettings();
+  }
+
+  /** Forget all OAuth tokens (does not touch the manual PAT). */
+  async clearTokens(): Promise<void> {
+    const secret = this.secretStorage();
+    await secret?.store(SECRET_ACCESS, "");
+    await secret?.store(SECRET_REFRESH, "");
+    this.settings.tokenExpiresAt = undefined;
+    await this.saveSettings();
   }
 
   // -------------------------------------------------------------------------
@@ -139,9 +401,11 @@ export default class BrainsPlugin extends Plugin {
   // -------------------------------------------------------------------------
 
   async pullFromBrains(): Promise<void> {
-    const apiKey = await this.getApiKey();
+    const apiKey = await this.getAuthToken();
     if (!apiKey) {
-      new Notice("Brains: No API key configured — open Settings → Brains Sync.");
+      new Notice(
+        'Brains: not connected — run "Connect to Brains", or add a token in Settings → Brains Sync.',
+      );
       return;
     }
 
@@ -229,9 +493,11 @@ export default class BrainsPlugin extends Plugin {
   // -------------------------------------------------------------------------
 
   async pushToBrains(): Promise<void> {
-    const apiKey = await this.getApiKey();
+    const apiKey = await this.getAuthToken();
     if (!apiKey) {
-      new Notice("Brains: No API key configured — open Settings → Brains Sync.");
+      new Notice(
+        'Brains: not connected — run "Connect to Brains", or add a token in Settings → Brains Sync.',
+      );
       return;
     }
 
@@ -403,29 +669,33 @@ class BrainsSettingTab extends PluginSettingTab {
           }),
       );
 
-    new Setting(containerEl)
-      .setName("API key")
-      .setDesc(
-        "Your Brains API key. Stored in Obsidian SecretStorage — never written to data.json.",
-      )
-      .addText((text) => {
-        text.inputEl.type = "password";
-        text.setPlaceholder("paste your API key here");
-
-        // Pre-fill if a key is already stored
-        this.plugin
-          .getApiKey()
-          .then((key) => {
-            if (key) text.setValue(key);
-          })
-          .catch(() => {
-            // SecretStorage unavailable — silently ignore
-          });
-
-        text.onChange(async (value) => {
-          await this.plugin.storeApiKey(value.trim());
-        });
+    // --- Account: one-click OAuth2 sign-in (no manual token) ---
+    const accountSetting = new Setting(containerEl)
+      .setName("Account")
+      .setDesc("Checking connection…");
+    void this.plugin.isConnected().then((connected) => {
+      accountSetting.setDesc(
+        connected
+          ? "Connected to Brains via OAuth. Tokens refresh automatically."
+          : "Not connected. Click Connect to sign in — no manual token needed.",
+      );
+      accountSetting.addButton((btn) => {
+        if (connected) {
+          btn
+            .setButtonText("Disconnect")
+            .setWarning()
+            .onClick(async () => {
+              await this.plugin.clearTokens();
+              this.display();
+            });
+        } else {
+          btn
+            .setButtonText("Connect to Brains")
+            .setCta()
+            .onClick(() => this.plugin.startOAuthConnect());
+        }
       });
+    });
 
     new Setting(containerEl)
       .setName("Vault folder")
@@ -441,5 +711,33 @@ class BrainsSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+
+    // --- Advanced: manual token fallback (self-hosters / non-OAuth setups) ---
+    containerEl.createEl("h3", { text: "Advanced" });
+
+    new Setting(containerEl)
+      .setName("API token (fallback)")
+      .setDesc(
+        "Optional. A Personal Access Token, used only when not connected via OAuth above. " +
+          "Stored in Obsidian SecretStorage — never written to data.json.",
+      )
+      .addText((text) => {
+        text.inputEl.type = "password";
+        text.setPlaceholder("paste a Personal Access Token");
+
+        // Pre-fill if a token is already stored.
+        this.plugin
+          .getApiKey()
+          .then((key) => {
+            if (key) text.setValue(key);
+          })
+          .catch(() => {
+            // SecretStorage unavailable — silently ignore.
+          });
+
+        text.onChange(async (value) => {
+          await this.plugin.storeApiKey(value.trim());
+        });
+      });
   }
 }
