@@ -68,12 +68,6 @@ interface BrainsPageRead {
   revision?: string;
 }
 
-// Obsidian's SecretStorage is not always reflected in the public type stubs;
-// cast to this minimal interface where needed.
-interface SecretStorageLike {
-  store(key: string, value: string): Promise<void>;
-  retrieve(key: string): Promise<string | null>;
-}
 
 // ---------------------------------------------------------------------------
 // PKCE helpers (Web Crypto — available in Obsidian's Electron runtime)
@@ -167,20 +161,12 @@ export default class BrainsPlugin extends Plugin {
   // Secret storage helpers
   // -------------------------------------------------------------------------
 
-  private secretStorage(): SecretStorageLike | null {
-    // SecretStorage lives on vault in Obsidian ≥1.7; cast for older type stubs.
-    const maybeVault = this.app.vault as unknown as {
-      secretStorage?: SecretStorageLike;
-    };
-    return maybeVault.secretStorage ?? null;
+  getApiKey(): string | null {
+    return this.app.secretStorage.getSecret(SECRET_PAT) ?? null;
   }
 
-  async getApiKey(): Promise<string | null> {
-    return (await this.secretStorage()?.retrieve(SECRET_PAT)) ?? null;
-  }
-
-  async storeApiKey(key: string): Promise<void> {
-    await this.secretStorage()?.store(SECRET_PAT, key);
+  storeApiKey(key: string): void {
+    this.app.secretStorage.setSecret(SECRET_PAT, key);
   }
 
   // -------------------------------------------------------------------------
@@ -188,8 +174,8 @@ export default class BrainsPlugin extends Plugin {
   // -------------------------------------------------------------------------
 
   /** True if an OAuth access token is currently stored. */
-  async isConnected(): Promise<boolean> {
-    return !!(await this.secretStorage()?.retrieve(SECRET_ACCESS));
+  isConnected(): boolean {
+    return !!this.app.secretStorage.getSecret(SECRET_ACCESS);
   }
 
   /**
@@ -197,13 +183,12 @@ export default class BrainsPlugin extends Plugin {
    * (refreshing if it is near expiry) when connected, otherwise the manual PAT.
    */
   private async getAuthToken(): Promise<string | null> {
-    const secret = this.secretStorage();
-    const access = (await secret?.retrieve(SECRET_ACCESS)) ?? null;
+    const access = this.app.secretStorage.getSecret(SECRET_ACCESS) ?? null;
     if (access) {
       const exp = this.settings.tokenExpiresAt ?? 0;
       if (Date.now() >= exp) {
         if (await this.refreshTokens()) {
-          return (await secret?.retrieve(SECRET_ACCESS)) ?? null;
+          return this.app.secretStorage.getSecret(SECRET_ACCESS) ?? null;
         }
         // Refresh failed — fall through to the PAT fallback below.
       } else {
@@ -327,8 +312,7 @@ export default class BrainsPlugin extends Plugin {
 
   /** Exchange a refresh token for a new access token. Returns success. */
   private async refreshTokens(): Promise<boolean> {
-    const secret = this.secretStorage();
-    const refresh = (await secret?.retrieve(SECRET_REFRESH)) ?? null;
+    const refresh = this.app.secretStorage.getSecret(SECRET_REFRESH) ?? null;
     const clientId = this.settings.oauthClientId;
     if (!refresh || !clientId) return false;
 
@@ -361,9 +345,8 @@ export default class BrainsPlugin extends Plugin {
 
   /** Persist access + refresh tokens and the refresh deadline (60s of slack). */
   private async storeTokens(t: BrainsTokenResponse): Promise<void> {
-    const secret = this.secretStorage();
-    if (t.access_token) await secret?.store(SECRET_ACCESS, t.access_token);
-    if (t.refresh_token) await secret?.store(SECRET_REFRESH, t.refresh_token);
+    if (t.access_token) this.app.secretStorage.setSecret(SECRET_ACCESS, t.access_token);
+    if (t.refresh_token) this.app.secretStorage.setSecret(SECRET_REFRESH, t.refresh_token);
     const ttl = typeof t.expires_in === "number" ? t.expires_in : 3600;
     this.settings.tokenExpiresAt = Date.now() + Math.max(0, ttl - 60) * 1000;
     await this.saveSettings();
@@ -371,9 +354,8 @@ export default class BrainsPlugin extends Plugin {
 
   /** Forget all OAuth tokens (does not touch the manual PAT). */
   async clearTokens(): Promise<void> {
-    const secret = this.secretStorage();
-    await secret?.store(SECRET_ACCESS, "");
-    await secret?.store(SECRET_REFRESH, "");
+    this.app.secretStorage.setSecret(SECRET_ACCESS, "");
+    this.app.secretStorage.setSecret(SECRET_REFRESH, "");
     this.settings.tokenExpiresAt = undefined;
     await this.saveSettings();
   }
@@ -673,28 +655,27 @@ class BrainsSettingTab extends PluginSettingTab {
     const accountSetting = new Setting(containerEl)
       .setName("Account")
       .setDesc("Checking connection…");
-    void this.plugin.isConnected().then((connected) => {
-      accountSetting.setDesc(
-        connected
-          ? "Connected to Brains via OAuth. Tokens refresh automatically."
-          : "Not connected. Click Connect to sign in — no manual token needed.",
-      );
-      accountSetting.addButton((btn) => {
-        if (connected) {
-          btn
-            .setButtonText("Disconnect")
-            .setWarning()
-            .onClick(async () => {
-              await this.plugin.clearTokens();
-              this.display();
-            });
-        } else {
-          btn
-            .setButtonText("Connect to Brains")
-            .setCta()
-            .onClick(() => this.plugin.startOAuthConnect());
-        }
-      });
+    const connected = this.plugin.isConnected();
+    accountSetting.setDesc(
+      connected
+        ? "Connected to Brains via OAuth. Tokens refresh automatically."
+        : "Not connected. Click Connect to sign in — no manual token needed.",
+    );
+    accountSetting.addButton((btn) => {
+      if (connected) {
+        btn
+          .setButtonText("Disconnect")
+          .setWarning()
+          .onClick(async () => {
+            await this.plugin.clearTokens();
+            this.display();
+          });
+      } else {
+        btn
+          .setButtonText("Connect to Brains")
+          .setCta()
+          .onClick(() => this.plugin.startOAuthConnect());
+      }
     });
 
     new Setting(containerEl)
@@ -726,17 +707,11 @@ class BrainsSettingTab extends PluginSettingTab {
         text.setPlaceholder("paste a Personal Access Token");
 
         // Pre-fill if a token is already stored.
-        this.plugin
-          .getApiKey()
-          .then((key) => {
-            if (key) text.setValue(key);
-          })
-          .catch(() => {
-            // SecretStorage unavailable — silently ignore.
-          });
+        const existingKey = this.plugin.getApiKey();
+        if (existingKey) text.setValue(existingKey);
 
-        text.onChange(async (value) => {
-          await this.plugin.storeApiKey(value.trim());
+        text.onChange((value) => {
+          this.plugin.storeApiKey(value.trim());
         });
       });
   }
