@@ -68,11 +68,13 @@ interface BrainsPageRead {
   revision?: string;
 }
 
-// Obsidian's SecretStorage is not always reflected in the public type stubs;
-// cast to this minimal interface where needed.
+// Obsidian's SecretStorage (App.secretStorage, since 1.11.4). The real methods
+// are synchronous; keep the return types await-tolerant so this also works if a
+// future build returns promises. Not always present in older type stubs, so we
+// cast to this minimal shape.
 interface SecretStorageLike {
-  store(key: string, value: string): Promise<void>;
-  retrieve(key: string): Promise<string | null>;
+  setSecret(id: string, secret: string): void | Promise<void>;
+  getSecret(id: string): string | null | Promise<string | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,19 +170,31 @@ export default class BrainsPlugin extends Plugin {
   // -------------------------------------------------------------------------
 
   private secretStorage(): SecretStorageLike | null {
-    // SecretStorage lives on vault in Obsidian ≥1.7; cast for older type stubs.
-    const maybeVault = this.app.vault as unknown as {
+    // SecretStorage lives on App (app.secretStorage), since Obsidian 1.11.4.
+    const maybeApp = this.app as unknown as {
       secretStorage?: SecretStorageLike;
     };
-    return maybeVault.secretStorage ?? null;
+    return maybeApp.secretStorage ?? null;
+  }
+
+  /** Read a secret by id (await-tolerant of the sync API). */
+  private async readSecret(id: string): Promise<string | null> {
+    const store = this.secretStorage();
+    if (!store) return null;
+    return (await store.getSecret(id)) ?? null;
+  }
+
+  /** Write a secret by id. */
+  private async writeSecret(id: string, value: string): Promise<void> {
+    await this.secretStorage()?.setSecret(id, value);
   }
 
   async getApiKey(): Promise<string | null> {
-    return (await this.secretStorage()?.retrieve(SECRET_PAT)) ?? null;
+    return this.readSecret(SECRET_PAT);
   }
 
   async storeApiKey(key: string): Promise<void> {
-    await this.secretStorage()?.store(SECRET_PAT, key);
+    await this.writeSecret(SECRET_PAT, key);
   }
 
   // -------------------------------------------------------------------------
@@ -189,7 +203,7 @@ export default class BrainsPlugin extends Plugin {
 
   /** True if an OAuth access token is currently stored. */
   async isConnected(): Promise<boolean> {
-    return !!(await this.secretStorage()?.retrieve(SECRET_ACCESS));
+    return !!(await this.readSecret(SECRET_ACCESS));
   }
 
   /**
@@ -197,13 +211,12 @@ export default class BrainsPlugin extends Plugin {
    * (refreshing if it is near expiry) when connected, otherwise the manual PAT.
    */
   private async getAuthToken(): Promise<string | null> {
-    const secret = this.secretStorage();
-    const access = (await secret?.retrieve(SECRET_ACCESS)) ?? null;
+    const access = await this.readSecret(SECRET_ACCESS);
     if (access) {
       const exp = this.settings.tokenExpiresAt ?? 0;
       if (Date.now() >= exp) {
         if (await this.refreshTokens()) {
-          return (await secret?.retrieve(SECRET_ACCESS)) ?? null;
+          return this.readSecret(SECRET_ACCESS);
         }
         // Refresh failed — fall through to the PAT fallback below.
       } else {
@@ -327,8 +340,7 @@ export default class BrainsPlugin extends Plugin {
 
   /** Exchange a refresh token for a new access token. Returns success. */
   private async refreshTokens(): Promise<boolean> {
-    const secret = this.secretStorage();
-    const refresh = (await secret?.retrieve(SECRET_REFRESH)) ?? null;
+    const refresh = await this.readSecret(SECRET_REFRESH);
     const clientId = this.settings.oauthClientId;
     if (!refresh || !clientId) return false;
 
@@ -361,9 +373,8 @@ export default class BrainsPlugin extends Plugin {
 
   /** Persist access + refresh tokens and the refresh deadline (60s of slack). */
   private async storeTokens(t: BrainsTokenResponse): Promise<void> {
-    const secret = this.secretStorage();
-    if (t.access_token) await secret?.store(SECRET_ACCESS, t.access_token);
-    if (t.refresh_token) await secret?.store(SECRET_REFRESH, t.refresh_token);
+    if (t.access_token) await this.writeSecret(SECRET_ACCESS, t.access_token);
+    if (t.refresh_token) await this.writeSecret(SECRET_REFRESH, t.refresh_token);
     const ttl = typeof t.expires_in === "number" ? t.expires_in : 3600;
     this.settings.tokenExpiresAt = Date.now() + Math.max(0, ttl - 60) * 1000;
     await this.saveSettings();
@@ -371,9 +382,8 @@ export default class BrainsPlugin extends Plugin {
 
   /** Forget all OAuth tokens (does not touch the manual PAT). */
   async clearTokens(): Promise<void> {
-    const secret = this.secretStorage();
-    await secret?.store(SECRET_ACCESS, "");
-    await secret?.store(SECRET_REFRESH, "");
+    await this.writeSecret(SECRET_ACCESS, "");
+    await this.writeSecret(SECRET_REFRESH, "");
     this.settings.tokenExpiresAt = undefined;
     await this.saveSettings();
   }
