@@ -1,0 +1,10 @@
+{
+  "id": "brains-sync",
+  "name": "Brains Sync",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "Bidirectional sync between your Obsidian vault and a Brains wiki instance. Pull pages from Brains into a vault subfolder and push edits back with one command.",
+  "author": "Brains",
+  "authorUrl": "https://usebrains.app",
+  "isDesktopOnly": true
+}
