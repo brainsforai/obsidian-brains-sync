@@ -11,7 +11,7 @@ Bidirectional sync between your [Obsidian](https://obsidian.md) vault and a [Bra
 
 ## Requirements
 
-- Obsidian ≥ 1.4.0 (desktop only)
+- Obsidian ≥ 1.11.4 (desktop and mobile)
 - A [Brains](https://usebrains.app) account (sign in with **Connect to Brains** — no manual token needed)
 
 ## Installation
