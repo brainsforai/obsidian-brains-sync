@@ -1,5 +1,6 @@
 import {
   App,
+  Modal,
   Notice,
   Plugin,
   PluginSettingTab,
@@ -9,6 +10,7 @@ import {
   requestUrl,
   type RequestUrlParam,
 } from "obsidian";
+import { unzipSync, zipSync, strToU8, strFromU8 } from "fflate";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -78,6 +80,36 @@ interface BrainsPageRead {
   fileId?: string;
   revision?: string;
 }
+
+// Preview shape from POST /api/v1/import-zip/upload?execute=false.
+interface BrainsImportPreview {
+  newCount?: number;
+  modifiedCount?: number;
+  unchangedCount?: number;
+  skippedCount?: number;
+  deletedCount?: number;
+}
+
+// Async job envelope from POST .../upload?execute=true and GET /api/v1/jobs/{id}.
+interface BrainsJob {
+  status?: "queued" | "running" | "done" | "failed";
+  error?: string;
+  result?: {
+    success?: boolean;
+    appliedCount?: number;
+    deletedCount?: number;
+    failedCount?: number;
+    failures?: Array<{ name: string; error: string }>;
+  };
+}
+
+// System pages that export (includeSystem=false) never emits, so a pull never
+// writes them into the vault. They must be excluded from the push archive diff,
+// or every push would try to archive them as "removed".
+const NON_ARCHIVABLE_PAGES = new Set(["index", "log"]);
+
+// Server page where the running, timestamped sync report is appended.
+const SYNC_LOG_PAGE = "history/page-sync-log";
 
 // Obsidian's SecretStorage (App.secretStorage, since 1.11.4). The real methods
 // are synchronous; keep the return types await-tolerant so this also works if a
@@ -693,76 +725,48 @@ export default class BrainsPlugin extends Plugin {
     const log: string[] = [];
 
     try {
-      // 1. List all pages
-      const listResp = await requestUrl({
-        url: `${base}/api/v1/pages`,
-        headers: this.apiHeaders(apiKey),
+      // One bulk request: download the whole wiki as a ZIP (export_wiki) and
+      // unpack it locally, instead of listing + reading each page (1+N calls).
+      const resp = await requestUrl({
+        url: `${base}/api/v1/export/download`,
+        headers: { Authorization: `Bearer ${apiKey}` },
+        throw: false,
       } as RequestUrlParam);
 
-      if (listResp.status !== 200) {
-        new Notice(`Brains: Pull failed — server returned ${listResp.status}.`);
+      if (resp.status !== 200) {
+        new Notice(`Brains: Pull failed — server returned ${resp.status}.`);
         return;
       }
 
-      // Server shape: { ok: true, result: { pages: [{ name }], count, backend } }.
-      // Tolerate a bare array, a result-as-array, or a legacy { pages } envelope.
-      const body = listResp.json as
-        | BrainsEnvelope<BrainsPageList | BrainsPage[]>
-        | { pages?: BrainsPage[] }
-        | BrainsPage[];
-      let pages: BrainsPage[];
-      if (Array.isArray(body)) {
-        pages = body;
-      } else if ("result" in body && body.result) {
-        const r = body.result as BrainsPageList | BrainsPage[];
-        pages = Array.isArray(r) ? r : (r.pages ?? []);
-      } else {
-        pages = (body as { pages?: BrainsPage[] }).pages ?? [];
-      }
+      const entries = unzipSync(new Uint8Array(resp.arrayBuffer));
+      const pageNames = Object.keys(entries).filter((name) => name.endsWith(".md"));
 
-      if (pages.length === 0) {
+      if (pageNames.length === 0) {
         new Notice("Brains: No pages found on server.");
         return;
       }
 
-      // 2. Ensure root folder exists
       if (!(await this.app.vault.adapter.exists(folder))) {
         await this.app.vault.createFolder(folder);
       }
 
       let written = 0;
-
-      for (const page of pages) {
+      for (const name of pageNames) {
         try {
-          const pageResp = await requestUrl({
-            url: `${base}/api/v1/page?name=${encodeURIComponent(page.name)}`,
-            headers: this.apiHeaders(apiKey),
-          } as RequestUrlParam);
-
-          if (pageResp.status !== 200) {
-            log.push(`SKIP  ${page.name} (HTTP ${pageResp.status})`);
-            continue;
-          }
-
-          // Server shape: { ok: true, result: { content, fileId, revision } }.
-          const pageBody = pageResp.json as BrainsEnvelope<BrainsPageRead> | null;
-          const page2 = pageBody?.result;
-          const content =
-            typeof page2?.content === "string" ? page2.content : "";
-
-          const filePath = this.pageToFilePath(folder, page.name);
+          const content = strFromU8(entries[name]);
+          const filePath = `${folder}/${name}`;
           await this.ensureParentDirs(filePath);
           // remote-wins: always overwrite (suppress the auto-push echo)
           this.suppressModify.add(filePath);
           await this.app.vault.adapter.write(filePath, content);
           written++;
-          log.push(`PULL  ${page.name}`);
-        } catch (pageErr) {
-          log.push(`ERROR ${page.name}: ${(pageErr as Error).message}`);
+          log.push(`PULL  ${name}`);
+        } catch (entryErr) {
+          log.push(`ERROR ${name}: ${(entryErr as Error).message}`);
         }
       }
 
-      this.showSyncLog("Pull complete", written, pages.length, log);
+      this.showSyncLog("Pull complete", written, pageNames.length, log);
     } catch (err) {
       new Notice(`Brains: Pull error — ${(err as Error).message}`);
     }
@@ -785,7 +789,6 @@ export default class BrainsPlugin extends Plugin {
 
     const base = this.baseUrl();
     const folder = this.settings.vaultFolder;
-    const log: string[] = [];
 
     try {
       if (!(await this.app.vault.adapter.exists(folder))) {
@@ -802,19 +805,120 @@ export default class BrainsPlugin extends Plugin {
         return;
       }
 
-      let pushed = 0;
-      // Progress notice we mutate in place so the long bulk run shows life.
-      const progress = new Notice(`Brains: Pushing 0/${files.length}…`, 0);
+      // 1. Zip the vault folder. Entry paths are server page paths with the
+      //    folder prefix stripped, e.g. "canonical/topic.md".
+      const entries: Record<string, Uint8Array> = {};
+      const vaultPageNames = new Set<string>();
+      for (const file of files) {
+        const content = await this.app.vault.read(file);
+        const entryPath = file.path.slice(folder.length + 1); // strip "folder/"
+        entries[entryPath] = strToU8(content);
+        vaultPageNames.add(this.filePathToPageName(folder, file.path));
+      }
+      const zipBytes = zipSync(entries);
 
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-        const res = await this.pushFile(file, apiKey, base, folder, log);
-        if (res.ok) pushed++;
-        progress.setMessage(`Brains: Pushing ${i + 1}/${files.length}… (${pushed} ok)`);
+      // 2. Preview the import (no writes) to learn create/update counts.
+      const preview = await this.uploadZip(base, apiKey, zipBytes, false);
+      if (!preview) {
+        new Notice("Brains: Push preview failed — no changes made.");
+        return;
+      }
+      const previewResult = (preview as BrainsEnvelope<BrainsImportPreview>)?.result ?? {};
+      const addCount = previewResult.newCount ?? 0;
+      const modCount = previewResult.modifiedCount ?? 0;
+
+      // 3. Compute the archive set: server pages absent from the vault, minus
+      //    system pages a pull never wrote (index/log) — otherwise every push
+      //    would try to archive them.
+      const serverPages = await this.listServerPageNames(base, apiKey);
+      const toArchive = serverPages.filter(
+        (name) => !vaultPageNames.has(name) && !NON_ARCHIVABLE_PAGES.has(name),
+      );
+
+      // 4. Dry-run confirm before any destructive (archive) activity.
+      const proceed = await this.confirmSync(addCount, modCount, toArchive.length);
+      if (!proceed) {
+        new Notice("Brains: Push cancelled — no changes made.");
+        return;
       }
 
-      progress.hide();
-      this.showSyncLog("Push complete", pushed, files.length, log);
+      // 5. Execute the import (additive, overwrite) — the one atomic server-side
+      //    step. If it fails we STOP before archiving anything: no partial replace.
+      const execResp = await this.uploadZip(base, apiKey, zipBytes, true);
+      const jobId = (execResp as { jobId?: string } | null)?.jobId;
+      if (!jobId) {
+        new Notice("Brains: Push failed — server did not start the import job. No changes made.");
+        return;
+      }
+      const job = await this.pollJob(base, apiKey, jobId);
+      if (job.status !== "done" || job.result?.success === false) {
+        const reason = job.error ?? `${job.result?.failedCount ?? 0} page(s) failed`;
+        new Notice(`Brains: Import failed (${reason}). Nothing archived — push aborted.`, 10000);
+        return;
+      }
+      const applied = job.result?.appliedCount ?? addCount + modCount;
+
+      // 6. Archive removed pages. Reversible (move to history/), so a per-page
+      //    failure here loses nothing — it is reported, not fatal.
+      const archived: string[] = [];
+      const archiveFailures: string[] = [];
+      for (const name of toArchive) {
+        try {
+          const resp = await requestUrl({
+            url: `${base}/api/v1/page/move`,
+            method: "POST",
+            headers: this.apiHeaders(apiKey),
+            throw: false,
+            body: JSON.stringify({ name, action: "archive" }),
+          } as RequestUrlParam);
+          if (resp.status === 200) archived.push(name);
+          else archiveFailures.push(`${name} (HTTP ${resp.status})`);
+        } catch (moveErr) {
+          archiveFailures.push(`${name}: ${(moveErr as Error).message}`);
+        }
+      }
+
+      // 7. Audit the index (cleanup ghost rows / unindexed pages). Best-effort.
+      let auditNote = "";
+      try {
+        const auditResp = await requestUrl({
+          url: `${base}/api/v1/audit`,
+          method: "POST",
+          headers: this.apiHeaders(apiKey),
+          throw: false,
+          body: JSON.stringify({ cleanup: true }),
+        } as RequestUrlParam);
+        auditNote = auditResp.status === 200 ? "audit ok" : `audit HTTP ${auditResp.status}`;
+      } catch (auditErr) {
+        auditNote = `audit error: ${(auditErr as Error).message}`;
+      }
+
+      // 8. Append a timestamped report of every change to the growing sync-log
+      //    page on the server.
+      const pushedNames = [...vaultPageNames].sort();
+      await this.appendSyncReport(base, apiKey, {
+        applied,
+        addCount,
+        modCount,
+        archived,
+        archiveFailures,
+        auditNote,
+        pushedPages: pushedNames,
+      });
+
+      // 9. Report to the user.
+      const summary: string[] = [
+        `${addCount} added`,
+        `${modCount} modified`,
+        `${archived.length} archived`,
+      ];
+      if (archiveFailures.length > 0) summary.push(`${archiveFailures.length} archive failures`);
+      const detail = [
+        `Applied ${applied} page(s). ${auditNote}.`,
+        ...archived.map((n) => `ARCHIVE ${n}`),
+        ...archiveFailures.map((n) => `FAIL    ${n}`),
+      ];
+      this.showSyncLog(`Push complete — ${summary.join(", ")}`, applied, files.length, detail);
     } catch (err) {
       new Notice(`Brains: Push error — ${(err as Error).message}`);
     }
@@ -968,6 +1072,178 @@ export default class BrainsPlugin extends Plugin {
       if (!(await this.app.vault.adapter.exists(accumulated))) {
         await this.app.vault.createFolder(accumulated);
       }
+    }
+  }
+
+  /**
+   * Upload a ZIP to the bulk import endpoint. execute=false previews (sync,
+   * returns counts); execute=true starts an async job (returns { jobId }).
+   * Additive mode with overwrite so push is authoritative for page content.
+   */
+  private async uploadZip(
+    base: string,
+    apiKey: string,
+    zipBytes: Uint8Array,
+    execute: boolean,
+  ): Promise<Record<string, unknown> | null> {
+    // Copy into an exact-sized ArrayBuffer — fflate may return a view.
+    const buffer = zipBytes.buffer.slice(
+      zipBytes.byteOffset,
+      zipBytes.byteOffset + zipBytes.byteLength,
+    );
+    const resp = await requestUrl({
+      url: `${base}/api/v1/import-zip/upload?execute=${execute}&mode=additive&conflictStrategy=overwrite`,
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/zip",
+      },
+      throw: false,
+      body: buffer,
+    } as RequestUrlParam);
+
+    // Preview returns 200; execute returns 202 (job queued).
+    if (resp.status !== 200 && resp.status !== 202) return null;
+    return resp.json as Record<string, unknown>;
+  }
+
+  /** Poll an async import job until it finishes (or fails / times out). */
+  private async pollJob(
+    base: string,
+    apiKey: string,
+    jobId: string,
+    maxAttempts = 600,
+    intervalMs = 500,
+  ): Promise<BrainsJob> {
+    for (let i = 0; i < maxAttempts; i++) {
+      const resp = await requestUrl({
+        url: `${base}/api/v1/jobs/${encodeURIComponent(jobId)}`,
+        headers: this.apiHeaders(apiKey),
+        throw: false,
+      } as RequestUrlParam);
+      if (resp.status === 200) {
+        const job =
+          (resp.json as BrainsEnvelope<BrainsJob>)?.result ??
+          (resp.json as { job?: BrainsJob })?.job ??
+          {};
+        if (job.status === "done" || job.status === "failed") return job;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+    }
+    return { status: "failed", error: "timed out waiting for import job" };
+  }
+
+  /** List all server page names, normalized without the .md extension. */
+  private async listServerPageNames(base: string, apiKey: string): Promise<string[]> {
+    const resp = await requestUrl({
+      url: `${base}/api/v1/pages`,
+      headers: this.apiHeaders(apiKey),
+      throw: false,
+    } as RequestUrlParam);
+    if (resp.status !== 200) return [];
+
+    // Tolerate a bare array, a result-as-array, or { result: { pages } }.
+    const body = resp.json as
+      | BrainsEnvelope<BrainsPageList | BrainsPage[]>
+      | { pages?: BrainsPage[] }
+      | BrainsPage[];
+    let pages: BrainsPage[];
+    if (Array.isArray(body)) {
+      pages = body;
+    } else if ("result" in body && body.result) {
+      const r = body.result as BrainsPageList | BrainsPage[];
+      pages = Array.isArray(r) ? r : (r.pages ?? []);
+    } else {
+      pages = (body as { pages?: BrainsPage[] }).pages ?? [];
+    }
+    return pages.map((p) => (p.name.endsWith(".md") ? p.name.slice(0, -3) : p.name));
+  }
+
+  /** Modal confirm shown before any destructive (archive) push activity. */
+  private confirmSync(
+    addCount: number,
+    modCount: number,
+    archiveCount: number,
+  ): Promise<boolean> {
+    return new Promise((resolve) => {
+      new SyncConfirmModal(this.app, addCount, modCount, archiveCount, resolve).open();
+    });
+  }
+
+  /**
+   * Append a timestamped report of this push to the running sync-log page,
+   * creating it on first run. Best-effort — a logging failure must not fail the
+   * push itself.
+   */
+  private async appendSyncReport(
+    base: string,
+    apiKey: string,
+    r: {
+      applied: number;
+      addCount: number;
+      modCount: number;
+      archived: string[];
+      archiveFailures: string[];
+      auditNote: string;
+      pushedPages: string[];
+    },
+  ): Promise<void> {
+    const ts = new Date().toISOString();
+    const lines: string[] = [
+      `## ${ts}`,
+      "",
+      `- Applied: ${r.applied} (added ${r.addCount}, modified ${r.modCount})`,
+      `- Archived: ${r.archived.length}`,
+      `- Audit: ${r.auditNote}`,
+    ];
+    if (r.pushedPages.length > 0) {
+      lines.push("- Pushed pages:");
+      lines.push(...r.pushedPages.map((n) => `  - ${n}`));
+    }
+    if (r.archived.length > 0) {
+      lines.push("- Archived pages:");
+      lines.push(...r.archived.map((n) => `  - ${n}`));
+    }
+    if (r.archiveFailures.length > 0) {
+      lines.push("- Archive failures:");
+      lines.push(...r.archiveFailures.map((n) => `  - ${n}`));
+    }
+    const block = lines.join("\n") + "\n";
+
+    try {
+      // Append if the page exists; otherwise create it.
+      const read = await requestUrl({
+        url: `${base}/api/v1/page?name=${encodeURIComponent(SYNC_LOG_PAGE)}`,
+        headers: this.apiHeaders(apiKey),
+        throw: false,
+      } as RequestUrlParam);
+
+      if (read.status === 200) {
+        await requestUrl({
+          url: `${base}/api/v1/page`,
+          method: "PATCH",
+          headers: this.apiHeaders(apiKey),
+          throw: false,
+          body: JSON.stringify({
+            name: SYNC_LOG_PAGE,
+            operations: [{ type: "append", text: `\n${block}` }],
+          }),
+        } as RequestUrlParam);
+      } else {
+        await requestUrl({
+          url: `${base}/api/v1/pages`,
+          method: "POST",
+          headers: this.apiHeaders(apiKey),
+          throw: false,
+          body: JSON.stringify({
+            name: SYNC_LOG_PAGE,
+            title: "Page Sync Log",
+            body: `# Page Sync Log\n\nTimestamped record of bulk pushes from the Obsidian plugin.\n\n${block}`,
+          }),
+        } as RequestUrlParam);
+      }
+    } catch {
+      // Logging is best-effort; never fail the push over it.
     }
   }
 
@@ -1147,5 +1423,60 @@ class BrainsSettingTab extends PluginSettingTab {
           await this.plugin.storeApiKey(value.trim());
         });
       });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Push confirmation modal
+// ---------------------------------------------------------------------------
+
+/**
+ * Dry-run confirmation shown before a bulk push. Surfaces the add/modify/archive
+ * counts so the user approves destructive (archive) activity explicitly.
+ */
+class SyncConfirmModal extends Modal {
+  private resolved = false;
+
+  constructor(
+    app: App,
+    private addCount: number,
+    private modCount: number,
+    private archiveCount: number,
+    private done: (proceed: boolean) => void,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.createEl("h2", { text: "Push to Brains" });
+    contentEl.createEl("p", { text: "Review the changes before pushing:" });
+
+    const list = contentEl.createEl("ul");
+    list.createEl("li", { text: `${this.addCount} page(s) added` });
+    list.createEl("li", { text: `${this.modCount} page(s) modified` });
+    list.createEl("li", {
+      text: `${this.archiveCount} page(s) archived (moved to history/, reversible)`,
+    });
+
+    const buttons = contentEl.createDiv({ cls: "modal-button-container" });
+    const confirm = buttons.createEl("button", { text: "Push", cls: "mod-cta" });
+    confirm.addEventListener("click", () => {
+      this.resolved = true;
+      this.done(true);
+      this.close();
+    });
+    const cancel = buttons.createEl("button", { text: "Cancel" });
+    cancel.addEventListener("click", () => {
+      this.resolved = true;
+      this.done(false);
+      this.close();
+    });
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+    // Closing via Esc / click-outside counts as cancel.
+    if (!this.resolved) this.done(false);
   }
 }
