@@ -4,6 +4,8 @@ import {
   Plugin,
   PluginSettingTab,
   Setting,
+  TFile,
+  debounce,
   requestUrl,
   type RequestUrlParam,
 } from "obsidian";
@@ -18,11 +20,20 @@ interface BrainsSettings {
   // OAuth2/PKCE state (non-secret; tokens live in SecretStorage).
   oauthClientId?: string;
   tokenExpiresAt?: number; // epoch ms when the access token should be refreshed
+  // Auto-sync
+  autoPush: boolean; // push edited files after a quiet period
+  autoPushDebounceMs: number; // idle time before an auto-push fires
+  pullOnOpen: boolean; // when a synced note is opened, refresh it from the server first
+  pollIntervalMin: number; // minutes between freshness polls of the open note
 }
 
 const DEFAULT_SETTINGS: BrainsSettings = {
   instanceUrl: "https://lets.usebrains.app",
   vaultFolder: "brains",
+  autoPush: true,
+  autoPushDebounceMs: 10000,
+  pullOnOpen: true,
+  pollIntervalMin: 2,
 };
 
 // OAuth2 + PKCE constants. The redirect uses Obsidian's custom URI scheme so the
@@ -69,6 +80,7 @@ interface BrainsPageRead {
 }
 
 
+
 // ---------------------------------------------------------------------------
 // PKCE helpers (Web Crypto — available in Obsidian's Electron runtime)
 // ---------------------------------------------------------------------------
@@ -100,11 +112,31 @@ async function pkceChallenge(verifier: string): Promise<string> {
 // Plugin
 // ---------------------------------------------------------------------------
 
+// Stop polling an open page after this many consecutive no-change checks.
+const POLL_MAX_QUIET = 3;
+
+type PollState = {
+  path: string;
+  revision?: string;
+  noChange: number;
+  timerId: number;
+};
+
 export default class BrainsPlugin extends Plugin {
   settings!: BrainsSettings;
 
+  // Auto-push bookkeeping
+  private dirtyFiles = new Set<string>();
+  private suppressModify = new Set<string>(); // paths we wrote programmatically
+  private autoPushDebouncer!: ReturnType<typeof debounce>;
+
+  // Pull-on-open + poll bookkeeping
+  private activePoll: PollState | null = null;
+  private windowFocused = true;
+
   async onload() {
     await this.loadSettings();
+    this.rebuildAutoPushDebouncer();
 
     // Ribbon icon — quick access to Pull
     this.addRibbonIcon("download", "Pull from Brains", () => {
@@ -125,6 +157,13 @@ export default class BrainsPlugin extends Plugin {
       callback: () => this.pushToBrains(),
     });
 
+    // Command: Push current file to Brains (fast single-file round-trip)
+    this.addCommand({
+      id: "push-current-file-to-brains",
+      name: "Push current file to Brains",
+      callback: () => this.pushCurrentFile(),
+    });
+
     // Command: Connect to Brains (OAuth2 + PKCE sign-in)
     this.addCommand({
       id: "connect-to-brains",
@@ -139,6 +178,235 @@ export default class BrainsPlugin extends Plugin {
 
     // Settings tab
     this.addSettingTab(new BrainsSettingTab(this.app, this));
+
+    // --- Auto-sync wiring ---------------------------------------------------
+    // Typing and saves both mark the file dirty and (re)arm the push debounce.
+    this.registerEvent(
+      this.app.workspace.on("editor-change", () => this.onEditorActivity()),
+    );
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => this.onVaultModify(file)),
+    );
+
+    // Pull-on-open + start the focused poll for the newly active note.
+    this.registerEvent(
+      this.app.workspace.on("file-open", (file) => void this.onFileOpen(file)),
+    );
+
+    // Focus gating: only poll while the window is focused; re-arm on refocus.
+    this.registerDomEvent(window, "focus", () => {
+      this.windowFocused = true;
+      if (this.activePoll) this.activePoll.noChange = 0; // re-arm an idle poll
+    });
+    this.registerDomEvent(window, "blur", () => {
+      this.windowFocused = false;
+    });
+
+    // Kick off pull-on-open for whatever is already open at load.
+    this.app.workspace.onLayoutReady(() => {
+      void this.onFileOpen(this.app.workspace.getActiveFile());
+    });
+  }
+
+  onunload() {
+    this.stopPoll();
+  }
+
+  rebuildAutoPushDebouncer(): void {
+    this.autoPushDebouncer = debounce(
+      () => void this.flushAutoPush(),
+      this.settings.autoPushDebounceMs,
+      true, // reset the timer on every new edit (true idle-gap behavior)
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Auto-sync: debounced push on edit, pull-on-open, focused poll
+  // -------------------------------------------------------------------------
+
+  /** True for markdown files that live under the configured sync folder. */
+  private isSyncedMd(file: TFile | null): file is TFile {
+    return (
+      !!file &&
+      file.extension === "md" &&
+      file.path.startsWith(this.settings.vaultFolder + "/")
+    );
+  }
+
+  private onEditorActivity(): void {
+    if (!this.settings.autoPush) return;
+    const file = this.app.workspace.getActiveFile();
+    if (this.isSyncedMd(file)) this.markDirty(file);
+  }
+
+  private onVaultModify(file: unknown): void {
+    if (!this.settings.autoPush) return;
+    if (!(file instanceof TFile) || !this.isSyncedMd(file)) return;
+    // Ignore the modify event caused by our own programmatic write.
+    if (this.suppressModify.has(file.path)) {
+      this.suppressModify.delete(file.path);
+      return;
+    }
+    this.markDirty(file);
+  }
+
+  private markDirty(file: TFile): void {
+    this.dirtyFiles.add(file.path);
+    this.autoPushDebouncer();
+  }
+
+  /** Push everything that has gone quiet since the last edit. */
+  private async flushAutoPush(): Promise<void> {
+    if (this.dirtyFiles.size === 0) return;
+    const paths = Array.from(this.dirtyFiles);
+    this.dirtyFiles.clear();
+
+    const apiKey = await this.getAuthToken();
+    if (!apiKey) {
+      // Re-queue so a later Connect doesn't drop the edits silently.
+      paths.forEach((p) => this.dirtyFiles.add(p));
+      new Notice("Brains: auto-push skipped — not connected.");
+      return;
+    }
+
+    const base = this.baseUrl();
+    const folder = this.settings.vaultFolder;
+    const log: string[] = [];
+    let pushed = 0;
+
+    for (const path of paths) {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof TFile)) continue;
+      const res = await this.pushFile(file, apiKey, base, folder, log);
+      if (res.ok) {
+        pushed++;
+        // Keep the open poll's revision in sync so we don't see our own write.
+        if (this.activePoll?.path === path && res.revision) {
+          this.activePoll.revision = res.revision;
+        }
+      }
+    }
+
+    if (pushed > 0 || log.some((l) => !l.startsWith("PUSH"))) {
+      const failed = log.filter(
+        (l) => l.startsWith("FAIL") || l.startsWith("ERROR"),
+      ).length;
+      new Notice(
+        `Brains: auto-pushed ${pushed}/${paths.length}` +
+          (failed ? ` — ⚠ ${failed} failed` : " ✓"),
+      );
+    }
+    console.log(`[Brains Sync] Auto-push (${pushed}/${paths.length}):\n${log.join("\n")}`);
+  }
+
+  /**
+   * Fetch one page and refresh the local file if the server copy differs.
+   * Sends If-None-Match so a future ETag-aware server can answer 304 cheaply.
+   * Never overwrites a file with pending local edits (returns "conflict").
+   */
+  private async pullFile(
+    file: TFile,
+    apiKey: string,
+    base: string,
+    folder: string,
+    knownRevision?: string,
+  ): Promise<{ status: "updated" | "unchanged" | "conflict" | "missing" | "error"; revision?: string }> {
+    const pageName = this.filePathToPageName(folder, file.path);
+    try {
+      const headers = this.apiHeaders(apiKey);
+      if (knownRevision) headers["If-None-Match"] = knownRevision;
+      const resp = await requestUrl({
+        url: `${base}/api/v1/page?name=${encodeURIComponent(pageName)}`,
+        headers,
+        throw: false,
+      } as RequestUrlParam);
+
+      if (resp.status === 304) return { status: "unchanged", revision: knownRevision };
+      if (resp.status === 404) return { status: "missing" };
+      if (resp.status !== 200) return { status: "error" };
+
+      const remote = (resp.json as BrainsEnvelope<BrainsPageRead> | null)?.result;
+      const remoteContent = typeof remote?.content === "string" ? remote.content : "";
+      const revision = remote?.revision;
+      const localContent = await this.app.vault.read(file);
+
+      if (remoteContent === localContent) return { status: "unchanged", revision };
+      if (this.dirtyFiles.has(file.path)) return { status: "conflict", revision };
+
+      this.suppressModify.add(file.path);
+      await this.app.vault.adapter.write(file.path, remoteContent);
+      return { status: "updated", revision };
+    } catch {
+      return { status: "error" };
+    }
+  }
+
+  /** On opening a synced note: refresh it from the server, then start polling. */
+  async onFileOpen(file: TFile | null): Promise<void> {
+    this.stopPoll();
+    if (!this.isSyncedMd(file)) return;
+    if (!this.settings.pullOnOpen) return;
+
+    const apiKey = await this.getAuthToken();
+    if (!apiKey) return;
+
+    const res = await this.pullFile(file, apiKey, this.baseUrl(), this.settings.vaultFolder);
+    if (res.status === "updated") new Notice(`Brains: refreshed ${file.name} from server`);
+    else if (res.status === "conflict") {
+      new Notice(`Brains: ${file.name} differs on server — local edits pending`);
+    }
+    this.startPoll(file, res.revision);
+  }
+
+  private startPoll(file: TFile, revision?: string): void {
+    const intervalMs = Math.max(30_000, this.settings.pollIntervalMin * 60_000);
+    const timerId = window.setInterval(() => void this.pollTick(file), intervalMs);
+    this.registerInterval(timerId);
+    this.activePoll = { path: file.path, revision, noChange: 0, timerId };
+  }
+
+  private stopPoll(): void {
+    if (this.activePoll) {
+      window.clearInterval(this.activePoll.timerId);
+      this.activePoll = null;
+    }
+  }
+
+  private async pollTick(file: TFile): Promise<void> {
+    const poll = this.activePoll;
+    if (!poll || poll.path !== file.path) return;
+    // Focus-gate: don't poll a backgrounded window or a non-active note.
+    if (!this.windowFocused) return;
+    if (this.app.workspace.getActiveFile()?.path !== file.path) return;
+
+    const apiKey = await this.getAuthToken();
+    if (!apiKey) return;
+
+    const res = await this.pullFile(
+      file,
+      apiKey,
+      this.baseUrl(),
+      this.settings.vaultFolder,
+      poll.revision,
+    );
+
+    // The active poll may have changed while we awaited.
+    if (this.activePoll !== poll || poll.path !== file.path) return;
+
+    if (res.status === "updated") {
+      poll.revision = res.revision ?? poll.revision;
+      poll.noChange = 0;
+      new Notice(`Brains: refreshed ${file.name} from server`);
+    } else {
+      if (res.revision) poll.revision = res.revision;
+      poll.noChange++;
+      if (poll.noChange >= POLL_MAX_QUIET) {
+        console.log(
+          `[Brains Sync] Poll: ${POLL_MAX_QUIET} quiet checks on ${file.name} — stopping`,
+        );
+        this.stopPoll();
+      }
+    }
   }
 
   // In-memory PKCE state for an in-progress authorization (not persisted; a
@@ -383,6 +651,8 @@ export default class BrainsPlugin extends Plugin {
   // -------------------------------------------------------------------------
 
   async pullFromBrains(): Promise<void> {
+    console.log("[Brains Sync] Pull: command invoked");
+    new Notice("Brains: Pulling…");
     const apiKey = await this.getAuthToken();
     if (!apiKey) {
       new Notice(
@@ -455,7 +725,8 @@ export default class BrainsPlugin extends Plugin {
 
           const filePath = this.pageToFilePath(folder, page.name);
           await this.ensureParentDirs(filePath);
-          // remote-wins: always overwrite
+          // remote-wins: always overwrite (suppress the auto-push echo)
+          this.suppressModify.add(filePath);
           await this.app.vault.adapter.write(filePath, content);
           written++;
           log.push(`PULL  ${page.name}`);
@@ -475,6 +746,8 @@ export default class BrainsPlugin extends Plugin {
   // -------------------------------------------------------------------------
 
   async pushToBrains(): Promise<void> {
+    console.log("[Brains Sync] Push: command invoked");
+    new Notice("Brains: Pushing…");
     const apiKey = await this.getAuthToken();
     if (!apiKey) {
       new Notice(
@@ -503,70 +776,135 @@ export default class BrainsPlugin extends Plugin {
       }
 
       let pushed = 0;
+      // Progress notice we mutate in place so the long bulk run shows life.
+      const progress = new Notice(`Brains: Pushing 0/${files.length}…`, 0);
 
-      for (const file of files) {
-        const content = await this.app.vault.read(file);
-        const pageName = this.filePathToPageName(folder, file.path);
-
-        try {
-          // Look up the page first: an existing page needs a full-rewrite PUT
-          // (update_page requires fileId + revision); a missing page is created.
-          const readResp = await requestUrl({
-            url: `${base}/api/v1/page?name=${encodeURIComponent(pageName)}`,
-            headers: this.apiHeaders(apiKey),
-            throw: false,
-          } as RequestUrlParam);
-
-          let resp;
-          if (readResp.status === 200) {
-            const read = (
-              readResp.json as BrainsEnvelope<BrainsPageRead> | null
-            )?.result;
-            if (!read?.fileId || !read?.revision) {
-              log.push(`FAIL  ${pageName} (missing fileId/revision)`);
-              continue;
-            }
-            resp = await requestUrl({
-              url: `${base}/api/v1/page`,
-              method: "PUT",
-              headers: this.apiHeaders(apiKey),
-              throw: false,
-              body: JSON.stringify({
-                name: pageName,
-                fileId: read.fileId,
-                revision: read.revision,
-                body: content,
-              }),
-            } as RequestUrlParam);
-          } else {
-            resp = await requestUrl({
-              url: `${base}/api/v1/pages`,
-              method: "POST",
-              headers: this.apiHeaders(apiKey),
-              throw: false,
-              body: JSON.stringify({
-                name: pageName,
-                title: this.pageNameToTitle(pageName),
-                body: content,
-              }),
-            } as RequestUrlParam);
-          }
-
-          if (resp.status === 200 || resp.status === 201) {
-            pushed++;
-            log.push(`PUSH  ${pageName}`);
-          } else {
-            log.push(`FAIL  ${pageName} (HTTP ${resp.status})`);
-          }
-        } catch (fileErr) {
-          log.push(`ERROR ${pageName}: ${(fileErr as Error).message}`);
-        }
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const res = await this.pushFile(file, apiKey, base, folder, log);
+        if (res.ok) pushed++;
+        progress.setMessage(`Brains: Pushing ${i + 1}/${files.length}… (${pushed} ok)`);
       }
 
+      progress.hide();
       this.showSyncLog("Push complete", pushed, files.length, log);
     } catch (err) {
       new Notice(`Brains: Push error — ${(err as Error).message}`);
     }
+  }
+
+  /**
+   * Push a single vault file to Brains: read the page to get fileId+revision and
+   * full-rewrite PUT it; create via POST if it doesn't exist yet. Appends a
+   * PUSH/FAIL/ERROR line to `log` and returns the new server revision on success.
+   */
+  private async pushFile(
+    file: TFile,
+    apiKey: string,
+    base: string,
+    folder: string,
+    log: string[],
+  ): Promise<{ ok: boolean; revision?: string }> {
+    const content = await this.app.vault.read(file);
+    const pageName = this.filePathToPageName(folder, file.path);
+
+    try {
+      // Look up the page first: an existing page needs a full-rewrite PUT
+      // (update_page requires fileId + revision); a missing page is created.
+      const readResp = await requestUrl({
+        url: `${base}/api/v1/page?name=${encodeURIComponent(pageName)}`,
+        headers: this.apiHeaders(apiKey),
+        throw: false,
+      } as RequestUrlParam);
+
+      let resp;
+      if (readResp.status === 200) {
+        const read = (
+          readResp.json as BrainsEnvelope<BrainsPageRead> | null
+        )?.result;
+        if (!read?.fileId || !read?.revision) {
+          log.push(`FAIL  ${pageName} (missing fileId/revision)`);
+          return { ok: false };
+        }
+        resp = await requestUrl({
+          url: `${base}/api/v1/page`,
+          method: "PUT",
+          headers: this.apiHeaders(apiKey),
+          throw: false,
+          body: JSON.stringify({
+            name: pageName,
+            fileId: read.fileId,
+            revision: read.revision,
+            body: content,
+          }),
+        } as RequestUrlParam);
+      } else {
+        resp = await requestUrl({
+          url: `${base}/api/v1/pages`,
+          method: "POST",
+          headers: this.apiHeaders(apiKey),
+          throw: false,
+          body: JSON.stringify({
+            name: pageName,
+            title: this.pageNameToTitle(pageName),
+            body: content,
+          }),
+        } as RequestUrlParam);
+      }
+
+      if (resp.status === 200 || resp.status === 201) {
+        log.push(`PUSH  ${pageName}`);
+        const revision = (resp.json as BrainsEnvelope<BrainsPageRead> | null)
+          ?.result?.revision;
+        return { ok: true, revision };
+      }
+      log.push(`FAIL  ${pageName} (HTTP ${resp.status})`);
+      return { ok: false };
+    } catch (fileErr) {
+      log.push(`ERROR ${pageName}: ${(fileErr as Error).message}`);
+      return { ok: false };
+    }
+  }
+
+  /**
+   * Push only the active note to Brains — a fast, observable round-trip for
+   * verifying sync without grinding through the whole vault.
+   */
+  async pushCurrentFile(): Promise<void> {
+    console.log("[Brains Sync] Push current file: command invoked");
+    const file = this.app.workspace.getActiveFile();
+    if (!file || file.extension !== "md") {
+      new Notice("Brains: open a markdown note first.");
+      return;
+    }
+
+    const folder = this.settings.vaultFolder;
+    if (!file.path.startsWith(folder + "/")) {
+      new Notice(`Brains: "${file.path}" is outside the "${folder}" sync folder.`);
+      return;
+    }
+
+    const apiKey = await this.getAuthToken();
+    if (!apiKey) {
+      new Notice(
+        'Brains: not connected — run "Connect to Brains", or add a token in Settings → Brains Sync.',
+      );
+      return;
+    }
+
+    new Notice(`Brains: Pushing ${file.name}…`);
+    const log: string[] = [];
+    const res = await this.pushFile(file, apiKey, this.baseUrl(), folder, log);
+    if (res.ok && this.activePoll?.path === file.path && res.revision) {
+      this.activePoll.revision = res.revision; // keep the poll's ETag current
+    }
+    new Notice(
+      res.ok
+        ? `Brains: Pushed ${file.name} ✓`
+        : `Brains: Push failed — ${log[0] ?? "unknown error"}`,
+      8000,
+    );
+    console.log(`[Brains Sync] Push current file: ${log[0] ?? "(no result)"}`);
   }
 
   // -------------------------------------------------------------------------
@@ -613,9 +951,12 @@ export default class BrainsPlugin extends Plugin {
     total: number,
     log: string[],
   ): void {
-    const preview = log.slice(0, 8).join("\n");
-    const overflow = log.length > 8 ? `\n…and ${log.length - 8} more` : "";
-    new Notice(`Brains: ${title} — ${done}/${total} pages.\n${preview}${overflow}`, 8000);
+    const failures = log.filter((l) => l.startsWith("FAIL") || l.startsWith("ERROR"));
+    const failSummary = failures.length > 0 ? ` — ⚠ ${failures.length} failed` : "";
+    const preview = (failures.length > 0 ? failures : log).slice(0, 8).join("\n");
+    const shown = failures.length > 0 ? failures.length : log.length;
+    const overflow = shown > 8 ? `\n…and ${shown - 8} more` : "";
+    new Notice(`Brains: ${title} — ${done}/${total} pages${failSummary}.\n${preview}${overflow}`, 8000);
     console.log(`[Brains Sync] ${title} (${done}/${total}):\n${log.join("\n")}`);
   }
 }
@@ -689,6 +1030,64 @@ class BrainsSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.vaultFolder)
           .onChange(async (value) => {
             this.plugin.settings.vaultFolder = value.trim() || "brains";
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    // --- Auto-sync ---
+    containerEl.createEl("h3", { text: "Auto-sync" });
+
+    new Setting(containerEl)
+      .setName("Auto-push on edit")
+      .setDesc(
+        "Push a note back to Brains automatically once you stop editing it for the delay below.",
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.autoPush).onChange(async (v) => {
+          this.plugin.settings.autoPush = v;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Auto-push delay (seconds)")
+      .setDesc("Idle time after your last keystroke/save before the note is pushed.")
+      .addText((text) =>
+        text
+          .setPlaceholder("10")
+          .setValue(String(Math.round(this.plugin.settings.autoPushDebounceMs / 1000)))
+          .onChange(async (value) => {
+            const secs = Math.max(1, Number(value) || 10);
+            this.plugin.settings.autoPushDebounceMs = secs * 1000;
+            await this.plugin.saveSettings();
+            this.plugin.rebuildAutoPushDebouncer();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Refresh on open")
+      .setDesc(
+        "When you open a synced note, pull the latest from Brains first (skipped if you have unsaved local edits).",
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.pullOnOpen).onChange(async (v) => {
+          this.plugin.settings.pullOnOpen = v;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Poll interval (minutes)")
+      .setDesc(
+        `While a note is open and focused, check Brains for updates this often. ` +
+          `Stops after ${POLL_MAX_QUIET} unchanged checks; resumes on activity.`,
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("2")
+          .setValue(String(this.plugin.settings.pollIntervalMin))
+          .onChange(async (value) => {
+            this.plugin.settings.pollIntervalMin = Math.max(0.5, Number(value) || 2);
             await this.plugin.saveSettings();
           }),
       );
