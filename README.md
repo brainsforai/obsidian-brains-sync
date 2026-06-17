@@ -53,7 +53,7 @@ Click **Connect to Brains** to sign in: your browser opens the Brains login, you
 - Click the **download** ribbon icon, or
 - Open the Command Palette (`Cmd/Ctrl+P`) → **Brains Sync: Pull from Brains**
 
-All pages are fetched from `GET /api/v1/pages` and written to `<vault-folder>/<page-name>.md`. Sub-paths (e.g. `projects/foo/bar`) become nested folders.
+The first pull bootstraps from `GET /api/v1/export/download`. Later pulls use `GET /api/v1/pages` (name + revision index) and fetch only changed pages, writing them to `<vault-folder>/<page-name>.md`.
 
 ### Push to Brains
 
