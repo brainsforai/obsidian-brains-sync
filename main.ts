@@ -1415,11 +1415,41 @@ export default class BrainsPlugin extends Plugin {
           timeout: PULL_EXPORT_TIMEOUT_MS,
         } as RequestUrlParam);
         if (resp.status === 200) {
+          // Legacy synchronous export: the body is the zip.
           return { ok: true, bytes: new Uint8Array(resp.arrayBuffer) };
         }
-        lastStatus = resp.status;
-        if (resp.status < 500 || attempt === PULL_EXPORT_MAX_RETRIES) {
-          return { ok: false, status: resp.status };
+        if (resp.status === 202) {
+          // Async export: poll the job, then download the produced zip.
+          const body = resp.json as { jobId?: string; downloadUrl?: string };
+          if (!body?.jobId) {
+            lastStatus = 202;
+            return { ok: false, status: 202 };
+          }
+          const job = await this.pollJob(base, apiKey, body.jobId);
+          if (job.status !== "done") {
+            lastError = job.error ?? "export job did not complete";
+            return { ok: false, error: lastError };
+          }
+          const downloadPath =
+            body.downloadUrl ?? `/api/v1/jobs/${body.jobId}/download`;
+          const dlResp = await requestUrl({
+            url: `${base}${downloadPath}`,
+            headers: { Authorization: "Bearer " + apiKey },
+            throw: false,
+            timeout: PULL_EXPORT_TIMEOUT_MS,
+          } as RequestUrlParam);
+          if (dlResp.status === 200) {
+            return { ok: true, bytes: new Uint8Array(dlResp.arrayBuffer) };
+          }
+          lastStatus = dlResp.status;
+          if (dlResp.status < 500 || attempt === PULL_EXPORT_MAX_RETRIES) {
+            return { ok: false, status: dlResp.status };
+          }
+        } else {
+          lastStatus = resp.status;
+          if (resp.status < 500 || attempt === PULL_EXPORT_MAX_RETRIES) {
+            return { ok: false, status: resp.status };
+          }
         }
       } catch (err) {
         lastError = (err as Error).message;
