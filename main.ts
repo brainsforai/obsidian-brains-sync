@@ -27,6 +27,7 @@ interface BrainsSettings {
   autoPushDebounceMs: number; // idle time before an auto-push fires
   pullOnOpen: boolean; // when a synced note is opened, refresh it from the server first
   pollIntervalMin: number; // minutes between freshness polls of the open note
+  revisionCache?: Record<string, string>; // pageName -> server revision seen on pull
 }
 
 const DEFAULT_SETTINGS: BrainsSettings = {
@@ -61,6 +62,7 @@ interface BrainsTokenResponse {
 
 interface BrainsPage {
   name: string;
+  revision?: string;
 }
 
 // The Brains HTTP API wraps every success response as { ok: true, result: ... }.
@@ -153,6 +155,8 @@ async function pkceChallenge(verifier: string): Promise<string> {
 
 // Stop polling an open page after this many consecutive no-change checks.
 const POLL_MAX_QUIET = 3;
+const PULL_EXPORT_TIMEOUT_MS = 120_000;
+const PULL_EXPORT_MAX_RETRIES = 3;
 
 type PollState = {
   path: string;
@@ -163,6 +167,9 @@ type PollState = {
 
 export default class BrainsPlugin extends Plugin {
   settings!: BrainsSettings;
+  private settingsTab: BrainsSettingTab | null = null;
+  private pullStatusEl: HTMLElement | null = null;
+  private authReachabilityIssue: string | null = null;
 
   // Auto-push bookkeeping
   private dirtyFiles = new Set<string>();
@@ -216,7 +223,11 @@ export default class BrainsPlugin extends Plugin {
     });
 
     // Settings tab
-    this.addSettingTab(new BrainsSettingTab(this.app, this));
+    this.settingsTab = new BrainsSettingTab(this.app, this);
+    this.addSettingTab(this.settingsTab);
+    this.pullStatusEl = this.addStatusBarItem();
+    this.pullStatusEl.setText("");
+    this.pullStatusEl.style.display = "none";
 
     // --- Auto-sync wiring ---------------------------------------------------
     // Typing and saves both mark the file dirty and (re)arm the push debounce.
@@ -510,6 +521,7 @@ export default class BrainsPlugin extends Plugin {
    * (refreshing if it is near expiry) when connected, otherwise the manual PAT.
    */
   private async getAuthToken(): Promise<string | null> {
+    this.authReachabilityIssue = null;
     const access = await this.readSecret(SECRET_ACCESS);
     if (access) {
       const exp = this.settings.tokenExpiresAt ?? 0;
@@ -517,6 +529,7 @@ export default class BrainsPlugin extends Plugin {
         if (await this.refreshTokens()) {
           return this.readSecret(SECRET_ACCESS);
         }
+        if (this.authReachabilityIssue) return null;
         // Refresh failed — fall through to the PAT fallback below.
       } else {
         return access;
@@ -629,7 +642,8 @@ export default class BrainsPlugin extends Plugin {
         return;
       }
       await this.storeTokens(json);
-      new Notice("Brains: connected ✓");
+      this.settingsTab?.display();
+      new Notice("Brains: sign-in complete — connected ✓");
     } catch (err) {
       new Notice(`Brains: token exchange error — ${(err as Error).message}`);
     } finally {
@@ -665,7 +679,10 @@ export default class BrainsPlugin extends Plugin {
       }
       await this.storeTokens(json);
       return true;
-    } catch {
+    } catch (err) {
+      if (this.isUnreachableError(err)) {
+        this.authReachabilityIssue = this.baseUrl();
+      }
       return false;
     }
   }
@@ -705,6 +722,40 @@ export default class BrainsPlugin extends Plugin {
     return this.settings.instanceUrl.replace(/\/$/, "");
   }
 
+  private isTransientNetworkError(err: unknown): boolean {
+    const msg = (err as Error)?.message ?? "";
+    return /(ERR_NETWORK_CHANGED|network crashed|ECONNRESET|ETIMEDOUT|timed out|socket hang up)/i.test(
+      msg,
+    );
+  }
+
+  private isUnreachableError(err: unknown): boolean {
+    const msg = (err as Error)?.message ?? "";
+    return /network|ENOTFOUND|ECONNREFUSED|failed to fetch|ERR_|timeout|timed out/i.test(msg);
+  }
+
+  private showAuthMissingNotice(): void {
+    if (this.authReachabilityIssue) {
+      new Notice(`Brains: cannot reach ${this.authReachabilityIssue} — check the instance URL.`);
+      return;
+    }
+    new Notice(
+      'Brains: not connected — run "Connect to Brains", or add a token in Settings → Brains Sync.',
+    );
+  }
+
+  private setPullStatus(text: string): void {
+    if (!this.pullStatusEl) return;
+    this.pullStatusEl.style.display = "";
+    this.pullStatusEl.setText(text);
+  }
+
+  private clearPullStatus(): void {
+    if (!this.pullStatusEl) return;
+    this.pullStatusEl.setText("");
+    this.pullStatusEl.style.display = "none";
+  }
+
   // -------------------------------------------------------------------------
   // Pull: fetch all pages from Brains and write them into the vault folder
   // -------------------------------------------------------------------------
@@ -712,11 +763,11 @@ export default class BrainsPlugin extends Plugin {
   async pullFromBrains(): Promise<void> {
     console.log("[Brains Sync] Pull: command invoked");
     new Notice("Brains: Pulling…");
+    this.setPullStatus("Brains: Pulling…");
     const apiKey = await this.getAuthToken();
     if (!apiKey) {
-      new Notice(
-        'Brains: not connected — run "Connect to Brains", or add a token in Settings → Brains Sync.',
-      );
+      this.clearPullStatus();
+      this.showAuthMissingNotice();
       return;
     }
 
@@ -725,24 +776,28 @@ export default class BrainsPlugin extends Plugin {
     const log: string[] = [];
 
     try {
-      // One bulk request: download the whole wiki as a ZIP (export_wiki) and
-      // unpack it locally, instead of listing + reading each page (1+N calls).
-      const resp = await requestUrl({
-        url: `${base}/api/v1/export/download`,
-        headers: { Authorization: `Bearer ${apiKey}` },
-        throw: false,
-      } as RequestUrlParam);
-
-      if (resp.status !== 200) {
-        new Notice(`Brains: Pull failed — server returned ${resp.status}.`);
+      const index = await this.listServerPageIndex(base, apiKey);
+      if (index.length === 0) {
+        const bootstrap = await this.pullFromExportBootstrap(base, apiKey, folder, log);
+        if (bootstrap.total > 0) {
+          this.settings.revisionCache = bootstrap.revisions;
+          await this.saveSettings();
+          this.showSyncLog("Pull complete", bootstrap.written, bootstrap.total, log);
+          new Notice(`Brains: Pull complete — ${bootstrap.written}/${bootstrap.total} pages.`);
+        }
         return;
       }
 
-      const entries = unzipSync(new Uint8Array(resp.arrayBuffer));
-      const pageNames = Object.keys(entries).filter((name) => name.endsWith(".md"));
-
-      if (pageNames.length === 0) {
-        new Notice("Brains: No pages found on server.");
+      const known = this.settings.revisionCache ?? {};
+      const hasRevisionsInIndex = index.some((p) => !!p.revision);
+      if (!hasRevisionsInIndex || Object.keys(known).length === 0) {
+        const bootstrap = await this.pullFromExportBootstrap(base, apiKey, folder, log);
+        if (bootstrap.total > 0) {
+          this.settings.revisionCache = bootstrap.revisions;
+          await this.saveSettings();
+          this.showSyncLog("Pull complete", bootstrap.written, bootstrap.total, log);
+          new Notice(`Brains: Pull complete — ${bootstrap.written}/${bootstrap.total} pages.`);
+        }
         return;
       }
 
@@ -750,25 +805,57 @@ export default class BrainsPlugin extends Plugin {
         await this.app.vault.createFolder(folder);
       }
 
-      let written = 0;
-      for (const name of pageNames) {
-        try {
-          const content = strFromU8(entries[name]);
-          const filePath = `${folder}/${name}`;
-          await this.ensureParentDirs(filePath);
-          // remote-wins: always overwrite (suppress the auto-push echo)
-          this.suppressModify.add(filePath);
-          await this.app.vault.adapter.write(filePath, content);
-          written++;
-          log.push(`PULL  ${name}`);
-        } catch (entryErr) {
-          log.push(`ERROR ${name}: ${(entryErr as Error).message}`);
+      const toFetch = index.filter((p) => !p.revision || known[p.name] !== p.revision);
+      if (toFetch.length === 0) {
+        const nextCache: Record<string, string> = {};
+        for (const page of index) {
+          if (page.revision) nextCache[page.name] = page.revision;
         }
+        this.settings.revisionCache = nextCache;
+        await this.saveSettings();
+        new Notice("Brains: Pull complete — already up to date.");
+        return;
       }
 
-      this.showSyncLog("Pull complete", written, pageNames.length, log);
+      let applied = 0;
+      const nextCache: Record<string, string> = { ...known };
+      for (let i = 0; i < toFetch.length; i++) {
+        const page = toFetch[i];
+        this.setPullStatus(`Brains: Pulling… (${i + 1}/${toFetch.length})`);
+        const res = await this.pullPageByName(
+          page.name,
+          apiKey,
+          base,
+          folder,
+          known[page.name],
+        );
+        if (res.status === "updated" || res.status === "created") {
+          applied++;
+          log.push(`PULL  ${page.name}.md`);
+        } else if (res.status === "conflict") {
+          log.push(`FAIL  ${page.name} (local edits pending)`);
+        } else if (res.status === "error") {
+          log.push(`ERROR ${page.name}: fetch failed`);
+        }
+        const rev = res.revision ?? page.revision;
+        if (rev) nextCache[page.name] = rev;
+      }
+
+      for (const page of index) {
+        if (page.revision) nextCache[page.name] = page.revision;
+      }
+      this.settings.revisionCache = nextCache;
+      await this.saveSettings();
+      this.showSyncLog("Pull complete", applied, toFetch.length, log);
+      new Notice(`Brains: Pull complete — ${applied}/${toFetch.length} pages updated.`);
     } catch (err) {
-      new Notice(`Brains: Pull error — ${(err as Error).message}`);
+      if (this.isUnreachableError(err)) {
+        new Notice(`Brains: cannot reach ${base} — check the instance URL.`);
+      } else {
+        new Notice(`Brains: Pull error — ${(err as Error).message}`);
+      }
+    } finally {
+      this.clearPullStatus();
     }
   }
 
@@ -781,9 +868,7 @@ export default class BrainsPlugin extends Plugin {
     new Notice("Brains: Pushing…");
     const apiKey = await this.getAuthToken();
     if (!apiKey) {
-      new Notice(
-        'Brains: not connected — run "Connect to Brains", or add a token in Settings → Brains Sync.',
-      );
+      this.showAuthMissingNotice();
       return;
     }
 
@@ -1017,9 +1102,7 @@ export default class BrainsPlugin extends Plugin {
 
     const apiKey = await this.getAuthToken();
     if (!apiKey) {
-      new Notice(
-        'Brains: not connected — run "Connect to Brains", or add a token in Settings → Brains Sync.',
-      );
+      this.showAuthMissingNotice();
       return;
     }
 
@@ -1133,6 +1216,19 @@ export default class BrainsPlugin extends Plugin {
     return { status: "failed", error: "timed out waiting for import job" };
   }
 
+  private normalizeServerPages(payload: unknown): BrainsPage[] {
+    const body = payload as
+      | BrainsEnvelope<BrainsPageList | BrainsPage[]>
+      | { pages?: BrainsPage[] }
+      | BrainsPage[];
+    if (Array.isArray(body)) return body;
+    if ("result" in body && body.result) {
+      const r = body.result as BrainsPageList | BrainsPage[];
+      return Array.isArray(r) ? r : (r.pages ?? []);
+    }
+    return (body as { pages?: BrainsPage[] }).pages ?? [];
+  }
+
   /** List all server page names, normalized without the .md extension. */
   private async listServerPageNames(base: string, apiKey: string): Promise<string[]> {
     const resp = await requestUrl({
@@ -1141,22 +1237,152 @@ export default class BrainsPlugin extends Plugin {
       throw: false,
     } as RequestUrlParam);
     if (resp.status !== 200) return [];
+    return this.normalizeServerPages(resp.json).map((p) =>
+      p.name.endsWith(".md") ? p.name.slice(0, -3) : p.name,
+    );
+  }
 
-    // Tolerate a bare array, a result-as-array, or { result: { pages } }.
-    const body = resp.json as
-      | BrainsEnvelope<BrainsPageList | BrainsPage[]>
-      | { pages?: BrainsPage[] }
-      | BrainsPage[];
-    let pages: BrainsPage[];
-    if (Array.isArray(body)) {
-      pages = body;
-    } else if ("result" in body && body.result) {
-      const r = body.result as BrainsPageList | BrainsPage[];
-      pages = Array.isArray(r) ? r : (r.pages ?? []);
-    } else {
-      pages = (body as { pages?: BrainsPage[] }).pages ?? [];
+  private async listServerPageIndex(
+    base: string,
+    apiKey: string,
+  ): Promise<Array<{ name: string; revision?: string }>> {
+    const resp = await requestUrl({
+      url: `${base}/api/v1/pages`,
+      headers: this.apiHeaders(apiKey),
+      throw: false,
+    } as RequestUrlParam);
+    if (resp.status !== 200) return [];
+    return this.normalizeServerPages(resp.json).map((p) => ({
+      name: p.name.endsWith(".md") ? p.name.slice(0, -3) : p.name,
+      revision: p.revision,
+    }));
+  }
+
+  private async pullPageByName(
+    pageName: string,
+    apiKey: string,
+    base: string,
+    folder: string,
+    knownRevision?: string,
+  ): Promise<{
+    status: "updated" | "created" | "unchanged" | "conflict" | "missing" | "error";
+    revision?: string;
+  }> {
+    try {
+      const headers = this.apiHeaders(apiKey);
+      if (knownRevision) headers["If-None-Match"] = knownRevision;
+      const resp = await requestUrl({
+        url: `${base}/api/v1/page?name=${encodeURIComponent(pageName)}`,
+        headers,
+        throw: false,
+      } as RequestUrlParam);
+      if (resp.status === 304) return { status: "unchanged", revision: knownRevision };
+      if (resp.status === 404) return { status: "missing" };
+      if (resp.status !== 200) return { status: "error" };
+
+      const remote = (resp.json as BrainsEnvelope<BrainsPageRead> | null)?.result;
+      const remoteContent = typeof remote?.content === "string" ? remote.content : "";
+      const revision = remote?.revision;
+      const filePath = this.pageToFilePath(folder, pageName);
+      const existing = this.app.vault.getAbstractFileByPath(filePath);
+
+      if (existing instanceof TFile) {
+        const localContent = await this.app.vault.read(existing);
+        if (remoteContent === localContent) return { status: "unchanged", revision };
+        if (this.dirtyFiles.has(existing.path)) return { status: "conflict", revision };
+        this.suppressModify.add(existing.path);
+        await this.app.vault.adapter.write(existing.path, remoteContent);
+        return { status: "updated", revision };
+      }
+
+      await this.ensureParentDirs(filePath);
+      await this.app.vault.create(filePath, remoteContent);
+      return { status: "created", revision };
+    } catch {
+      return { status: "error" };
     }
-    return pages.map((p) => (p.name.endsWith(".md") ? p.name.slice(0, -3) : p.name));
+  }
+
+  private async downloadExportZipWithRetry(
+    base: string,
+    apiKey: string,
+  ): Promise<{ ok: true; bytes: Uint8Array } | { ok: false; status?: number; error?: string }> {
+    let lastError: string | undefined;
+    let lastStatus: number | undefined;
+    for (let attempt = 1; attempt <= PULL_EXPORT_MAX_RETRIES; attempt++) {
+      try {
+        const resp = await requestUrl({
+          url: `${base}/api/v1/export/download`,
+          headers: { Authorization: "Bearer " + apiKey },
+          throw: false,
+          timeout: PULL_EXPORT_TIMEOUT_MS,
+        } as RequestUrlParam);
+        if (resp.status === 200) {
+          return { ok: true, bytes: new Uint8Array(resp.arrayBuffer) };
+        }
+        lastStatus = resp.status;
+        if (resp.status < 500 || attempt === PULL_EXPORT_MAX_RETRIES) {
+          return { ok: false, status: resp.status };
+        }
+      } catch (err) {
+        lastError = (err as Error).message;
+        if (!this.isTransientNetworkError(err) || attempt === PULL_EXPORT_MAX_RETRIES) {
+          return { ok: false, error: lastError };
+        }
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 600 * attempt));
+    }
+    return { ok: false, status: lastStatus, error: lastError };
+  }
+
+  private async pullFromExportBootstrap(
+    base: string,
+    apiKey: string,
+    folder: string,
+    log: string[],
+  ): Promise<{ written: number; total: number; revisions: Record<string, string> }> {
+    this.setPullStatus("Brains: Pulling… (bootstrap export)");
+    const dl = await this.downloadExportZipWithRetry(base, apiKey);
+    if (!dl.ok) {
+      if (dl.status) new Notice(`Brains: Pull failed — server returned ${dl.status}.`);
+      else new Notice(`Brains: Pull error — ${dl.error ?? "download failed"}`);
+      return { written: 0, total: 0, revisions: {} };
+    }
+
+    const entries = unzipSync(dl.bytes);
+    const pageNames = Object.keys(entries).filter((name) => name.endsWith(".md"));
+    if (pageNames.length === 0) {
+      new Notice("Brains: No pages found on server.");
+      return { written: 0, total: 0, revisions: {} };
+    }
+
+    if (!(await this.app.vault.adapter.exists(folder))) {
+      await this.app.vault.createFolder(folder);
+    }
+
+    let written = 0;
+    for (let i = 0; i < pageNames.length; i++) {
+      const name = pageNames[i];
+      this.setPullStatus(`Brains: Pulling… (bootstrap ${i + 1}/${pageNames.length})`);
+      try {
+        const content = strFromU8(entries[name]);
+        const filePath = `${folder}/${name}`;
+        await this.ensureParentDirs(filePath);
+        this.suppressModify.add(filePath);
+        await this.app.vault.adapter.write(filePath, content);
+        written++;
+        log.push(`PULL  ${name}`);
+      } catch (entryErr) {
+        log.push(`ERROR ${name}: ${(entryErr as Error).message}`);
+      }
+    }
+
+    const index = await this.listServerPageIndex(base, apiKey);
+    const revisions: Record<string, string> = {};
+    for (const page of index) {
+      if (page.revision) revisions[page.name] = page.revision;
+    }
+    return { written, total: pageNames.length, revisions };
   }
 
   /** Modal confirm shown before any destructive (archive) push activity. */
