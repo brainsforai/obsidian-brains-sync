@@ -102,6 +102,12 @@ interface BrainsJob {
     deletedCount?: number;
     failedCount?: number;
     failures?: Array<{ name: string; error: string }>;
+    // import-preview job results (execute=false)
+    totalEntries?: number;
+    newCount?: number;
+    modifiedCount?: number;
+    unchangedCount?: number;
+    skippedCount?: number;
   };
 }
 
@@ -903,14 +909,33 @@ export default class BrainsPlugin extends Plugin {
       const zipBytes = zipSync(entries);
 
       // 2. Preview the import (no writes) to learn create/update counts.
+      //    The server runs the preview as an async job (202 + jobId) to dodge
+      //    the Railway gateway timeout on large wikis, so poll the job for the
+      //    counts. Fall back to a synchronous { result } body for older servers.
       const preview = await this.uploadZip(base, apiKey, zipBytes, false);
       if (!preview) {
         new Notice("Brains: Push preview failed — no changes made.");
         return;
       }
-      const previewResult = (preview as BrainsEnvelope<BrainsImportPreview>)?.result ?? {};
-      const addCount = previewResult.newCount ?? 0;
-      const modCount = previewResult.modifiedCount ?? 0;
+      let addCount: number;
+      let modCount: number;
+      const previewJobId = (preview as { jobId?: string }).jobId;
+      if (previewJobId) {
+        const previewJob = await this.pollJob(base, apiKey, previewJobId);
+        if (previewJob.status !== "done") {
+          new Notice(
+            `Brains: Push preview failed (${previewJob.error ?? "job did not complete"}) — no changes made.`,
+          );
+          return;
+        }
+        addCount = previewJob.result?.newCount ?? 0;
+        modCount = previewJob.result?.modifiedCount ?? 0;
+      } else {
+        const previewResult =
+          (preview as BrainsEnvelope<BrainsImportPreview>)?.result ?? {};
+        addCount = previewResult.newCount ?? 0;
+        modCount = previewResult.modifiedCount ?? 0;
+      }
 
       // 3. Compute the archive set: server pages absent from the vault, minus
       //    system pages a pull never wrote (index/log) — otherwise every push
@@ -1159,8 +1184,9 @@ export default class BrainsPlugin extends Plugin {
   }
 
   /**
-   * Upload a ZIP to the bulk import endpoint. execute=false previews (sync,
-   * returns counts); execute=true starts an async job (returns { jobId }).
+   * Upload a ZIP to the bulk import endpoint. Both execute=false (preview) and
+   * execute=true (import) start an async job and return { jobId }; poll it for
+   * results. Older servers returned preview counts synchronously ({ result }).
    * Additive mode with overwrite so push is authoritative for page content.
    */
   private async uploadZip(
