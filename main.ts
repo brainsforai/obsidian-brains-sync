@@ -28,6 +28,7 @@ interface BrainsSettings {
   pullOnOpen: boolean; // when a synced note is opened, refresh it from the server first
   pollIntervalMin: number; // minutes between freshness polls of the open note
   revisionCache?: Record<string, string>; // pageName -> server revision seen on pull
+  contentHashCache?: Record<string, string>; // pageName -> sha256 of last-synced local content (delta push)
 }
 
 const DEFAULT_SETTINGS: BrainsSettings = {
@@ -115,6 +116,15 @@ interface BrainsJob {
 // writes them into the vault. They must be excluded from the push archive diff,
 // or every push would try to archive them as "removed".
 const NON_ARCHIVABLE_PAGES = new Set(["index", "log"]);
+
+/** SHA-256 hex of a string (Web Crypto — available in Obsidian's Electron runtime). */
+async function sha256Hex(text: string): Promise<string> {
+  const data = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
 
 // Server page where the running, timestamped sync report is appended.
 const SYNC_LOG_PAGE = "history/page-sync-log";
@@ -340,8 +350,15 @@ export default class BrainsPlugin extends Plugin {
         if (this.activePoll?.path === path && res.revision) {
           this.activePoll.revision = res.revision;
         }
+        // Keep the delta-push baseline current so a later full push doesn't
+        // re-send this file.
+        if (!this.settings.contentHashCache) this.settings.contentHashCache = {};
+        this.settings.contentHashCache[this.filePathToPageName(folder, path)] =
+          await sha256Hex(await this.app.vault.read(file));
       }
     }
+
+    if (pushed > 0) await this.saveSettings();
 
     if (pushed > 0 || log.some((l) => !l.startsWith("PUSH"))) {
       const failed = log.filter(
@@ -851,6 +868,8 @@ export default class BrainsPlugin extends Plugin {
         if (page.revision) nextCache[page.name] = page.revision;
       }
       this.settings.revisionCache = nextCache;
+      // Refresh the delta-push baseline now that local files match the server.
+      this.settings.contentHashCache = await this.computeVaultHashes(folder);
       await this.saveSettings();
       this.showSyncLog("Pull complete", applied, toFetch.length, log);
       new Notice(`Brains: Pull complete — ${applied}/${toFetch.length} pages updated.`);
@@ -863,6 +882,20 @@ export default class BrainsPlugin extends Plugin {
     } finally {
       this.clearPullStatus();
     }
+  }
+
+  /** Hash every synced .md file in the vault folder (pageName -> sha256). */
+  private async computeVaultHashes(folder: string): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    const files = this.app.vault
+      .getFiles()
+      .filter((f) => f.path.startsWith(folder + "/") && f.extension === "md");
+    for (const file of files) {
+      out[this.filePathToPageName(folder, file.path)] = await sha256Hex(
+        await this.app.vault.read(file),
+      );
+    }
+    return out;
   }
 
   // -------------------------------------------------------------------------
@@ -896,77 +929,109 @@ export default class BrainsPlugin extends Plugin {
         return;
       }
 
-      // 1. Zip the vault folder. Entry paths are server page paths with the
-      //    folder prefix stripped, e.g. "canonical/topic.md".
-      const entries: Record<string, Uint8Array> = {};
+      // 1. Delta: hash every local file and compare against the last-synced
+      //    hashes, so we only upload what actually changed. Reading the whole
+      //    vault is local + cheap; the expensive part (the server-side diff
+      //    scan + import) then runs over a tiny zip instead of all N pages.
+      const hashCache = this.settings.contentHashCache ?? {};
+      const currentHashes: Record<string, string> = {};
       const vaultPageNames = new Set<string>();
+      const changed: { entryPath: string; content: string }[] = [];
+      const changedNames: string[] = [];
       for (const file of files) {
         const content = await this.app.vault.read(file);
-        const entryPath = file.path.slice(folder.length + 1); // strip "folder/"
-        entries[entryPath] = strToU8(content);
-        vaultPageNames.add(this.filePathToPageName(folder, file.path));
-      }
-      const zipBytes = zipSync(entries);
-
-      // 2. Preview the import (no writes) to learn create/update counts.
-      //    The server runs the preview as an async job (202 + jobId) to dodge
-      //    the Railway gateway timeout on large wikis, so poll the job for the
-      //    counts. Fall back to a synchronous { result } body for older servers.
-      const preview = await this.uploadZip(base, apiKey, zipBytes, false);
-      if (!preview) {
-        new Notice("Brains: Push preview failed — no changes made.");
-        return;
-      }
-      let addCount: number;
-      let modCount: number;
-      const previewJobId = (preview as { jobId?: string }).jobId;
-      if (previewJobId) {
-        const previewJob = await this.pollJob(base, apiKey, previewJobId);
-        if (previewJob.status !== "done") {
-          new Notice(
-            `Brains: Push preview failed (${previewJob.error ?? "job did not complete"}) — no changes made.`,
-          );
-          return;
+        const pageName = this.filePathToPageName(folder, file.path);
+        const hash = await sha256Hex(content);
+        currentHashes[pageName] = hash;
+        vaultPageNames.add(pageName);
+        if (hashCache[pageName] !== hash) {
+          changed.push({ entryPath: file.path.slice(folder.length + 1), content });
+          changedNames.push(pageName);
         }
-        addCount = previewJob.result?.newCount ?? 0;
-        modCount = previewJob.result?.modifiedCount ?? 0;
-      } else {
-        const previewResult =
-          (preview as BrainsEnvelope<BrainsImportPreview>)?.result ?? {};
-        addCount = previewResult.newCount ?? 0;
-        modCount = previewResult.modifiedCount ?? 0;
       }
 
-      // 3. Compute the archive set: server pages absent from the vault, minus
-      //    system pages a pull never wrote (index/log) — otherwise every push
-      //    would try to archive them.
+      // 2. Archive set: server pages absent from the vault, minus system pages
+      //    a pull never wrote (index/log). Computed regardless of content edits.
       const serverPages = await this.listServerPageNames(base, apiKey);
       const toArchive = serverPages.filter(
         (name) => !vaultPageNames.has(name) && !NON_ARCHIVABLE_PAGES.has(name),
       );
 
-      // 4. Dry-run confirm before any destructive (archive) activity.
-      const proceed = await this.confirmSync(addCount, modCount, toArchive.length);
-      if (!proceed) {
-        new Notice("Brains: Push cancelled — no changes made.");
+      // Nothing changed and nothing to archive → no server scan needed.
+      if (changed.length === 0 && toArchive.length === 0) {
+        this.settings.contentHashCache = currentHashes;
+        await this.saveSettings();
+        new Notice("Brains: Push complete — already up to date.");
         return;
       }
 
-      // 5. Execute the import (additive, overwrite) — the one atomic server-side
-      //    step. If it fails we STOP before archiving anything: no partial replace.
-      const execResp = await this.uploadZip(base, apiKey, zipBytes, true);
-      const jobId = (execResp as { jobId?: string } | null)?.jobId;
-      if (!jobId) {
-        new Notice("Brains: Push failed — server did not start the import job. No changes made.");
-        return;
+      let addCount = 0;
+      let modCount = 0;
+      let applied = 0;
+
+      // 3. Preview + import ONLY the changed files (small zip). When only
+      //    archives are pending, skip straight to the confirm.
+      if (changed.length > 0) {
+        const entries: Record<string, Uint8Array> = {};
+        for (const c of changed) entries[c.entryPath] = strToU8(c.content);
+        const zipBytes = zipSync(entries);
+
+        // Preview runs as an async job (202 + jobId) on the server to dodge the
+        // Railway gateway timeout; poll for counts. Fall back to a synchronous
+        // { result } body for older servers.
+        const preview = await this.uploadZip(base, apiKey, zipBytes, false);
+        if (!preview) {
+          new Notice("Brains: Push preview failed — no changes made.");
+          return;
+        }
+        const previewJobId = (preview as { jobId?: string }).jobId;
+        if (previewJobId) {
+          const previewJob = await this.pollJob(base, apiKey, previewJobId);
+          if (previewJob.status !== "done") {
+            new Notice(
+              `Brains: Push preview failed (${previewJob.error ?? "job did not complete"}) — no changes made.`,
+            );
+            return;
+          }
+          addCount = previewJob.result?.newCount ?? 0;
+          modCount = previewJob.result?.modifiedCount ?? 0;
+        } else {
+          const previewResult =
+            (preview as BrainsEnvelope<BrainsImportPreview>)?.result ?? {};
+          addCount = previewResult.newCount ?? 0;
+          modCount = previewResult.modifiedCount ?? 0;
+        }
+
+        // 4. Dry-run confirm before any destructive (archive) activity.
+        const proceed = await this.confirmSync(addCount, modCount, toArchive.length);
+        if (!proceed) {
+          new Notice("Brains: Push cancelled — no changes made.");
+          return;
+        }
+
+        // 5. Execute the import (additive, overwrite). If it fails we STOP
+        //    before archiving anything: no partial replace.
+        const execResp = await this.uploadZip(base, apiKey, zipBytes, true);
+        const jobId = (execResp as { jobId?: string } | null)?.jobId;
+        if (!jobId) {
+          new Notice("Brains: Push failed — server did not start the import job. No changes made.");
+          return;
+        }
+        const job = await this.pollJob(base, apiKey, jobId);
+        if (job.status !== "done" || job.result?.success === false) {
+          const reason = job.error ?? `${job.result?.failedCount ?? 0} page(s) failed`;
+          new Notice(`Brains: Import failed (${reason}). Nothing archived — push aborted.`, 10000);
+          return;
+        }
+        applied = job.result?.appliedCount ?? addCount + modCount;
+      } else {
+        // Only archives pending — still confirm before destructive activity.
+        const proceed = await this.confirmSync(0, 0, toArchive.length);
+        if (!proceed) {
+          new Notice("Brains: Push cancelled — no changes made.");
+          return;
+        }
       }
-      const job = await this.pollJob(base, apiKey, jobId);
-      if (job.status !== "done" || job.result?.success === false) {
-        const reason = job.error ?? `${job.result?.failedCount ?? 0} page(s) failed`;
-        new Notice(`Brains: Import failed (${reason}). Nothing archived — push aborted.`, 10000);
-        return;
-      }
-      const applied = job.result?.appliedCount ?? addCount + modCount;
 
       // 6. Archive removed pages. Reversible (move to history/), so a per-page
       //    failure here loses nothing — it is reported, not fatal.
@@ -1003,9 +1068,15 @@ export default class BrainsPlugin extends Plugin {
         auditNote = `audit error: ${(auditErr as Error).message}`;
       }
 
-      // 8. Append a timestamped report of every change to the growing sync-log
+      // 8. Persist the new hash baseline so the next push only sees later edits.
+      //    currentHashes already reflects the post-push server state (changed
+      //    files were just uploaded; the rest were identical).
+      this.settings.contentHashCache = currentHashes;
+      await this.saveSettings();
+
+      // 9. Append a timestamped report of every change to the growing sync-log
       //    page on the server.
-      const pushedNames = [...vaultPageNames].sort();
+      const pushedNames = [...changedNames].sort();
       await this.appendSyncReport(base, apiKey, {
         applied,
         addCount,
@@ -1016,7 +1087,7 @@ export default class BrainsPlugin extends Plugin {
         pushedPages: pushedNames,
       });
 
-      // 9. Report to the user.
+      // 10. Report to the user.
       const summary: string[] = [
         `${addCount} added`,
         `${modCount} modified`,
@@ -1387,6 +1458,7 @@ export default class BrainsPlugin extends Plugin {
     }
 
     let written = 0;
+    const hashes: Record<string, string> = {};
     for (let i = 0; i < pageNames.length; i++) {
       const name = pageNames[i];
       this.setPullStatus(`Brains: Pulling… (bootstrap ${i + 1}/${pageNames.length})`);
@@ -1396,12 +1468,15 @@ export default class BrainsPlugin extends Plugin {
         await this.ensureParentDirs(filePath);
         this.suppressModify.add(filePath);
         await this.app.vault.adapter.write(filePath, content);
+        hashes[name.replace(/\.md$/, "")] = await sha256Hex(content);
         written++;
         log.push(`PULL  ${name}`);
       } catch (entryErr) {
         log.push(`ERROR ${name}: ${(entryErr as Error).message}`);
       }
     }
+    // Seed the delta-push baseline so the next push only sends later edits.
+    this.settings.contentHashCache = hashes;
 
     const index = await this.listServerPageIndex(base, apiKey);
     const revisions: Record<string, string> = {};
