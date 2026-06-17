@@ -97,6 +97,7 @@ interface BrainsImportPreview {
 interface BrainsJob {
   status?: "queued" | "running" | "done" | "failed";
   error?: string;
+  progress?: { processed?: number; total?: number; phase?: string };
   result?: {
     success?: boolean;
     appliedCount?: number;
@@ -797,11 +798,14 @@ export default class BrainsPlugin extends Plugin {
     const base = this.baseUrl();
     const folder = this.settings.vaultFolder;
     const log: string[] = [];
+    const progress = new SyncProgressModal(this.app, "Pull from Brains");
+    progress.open();
+    progress.setMessage("Checking for changes…");
 
     try {
       const index = await this.listServerPageIndex(base, apiKey);
       if (index.length === 0) {
-        const bootstrap = await this.pullFromExportBootstrap(base, apiKey, folder, log);
+        const bootstrap = await this.pullFromExportBootstrap(base, apiKey, folder, log, progress);
         if (bootstrap.total > 0) {
           this.settings.revisionCache = bootstrap.revisions;
           await this.saveSettings();
@@ -814,7 +818,7 @@ export default class BrainsPlugin extends Plugin {
       const known = this.settings.revisionCache ?? {};
       const hasRevisionsInIndex = index.some((p) => !!p.revision);
       if (!hasRevisionsInIndex || Object.keys(known).length === 0) {
-        const bootstrap = await this.pullFromExportBootstrap(base, apiKey, folder, log);
+        const bootstrap = await this.pullFromExportBootstrap(base, apiKey, folder, log, progress);
         if (bootstrap.total > 0) {
           this.settings.revisionCache = bootstrap.revisions;
           await this.saveSettings();
@@ -842,9 +846,11 @@ export default class BrainsPlugin extends Plugin {
 
       let applied = 0;
       const nextCache: Record<string, string> = { ...known };
+      progress.setMessage(`Pulling ${toFetch.length} changed page(s)…`);
       for (let i = 0; i < toFetch.length; i++) {
         const page = toFetch[i];
         this.setPullStatus(`Brains: Pulling… (${i + 1}/${toFetch.length})`);
+        progress.setProgress(i + 1, toFetch.length, `${i + 1} / ${toFetch.length}`);
         const res = await this.pullPageByName(
           page.name,
           apiKey,
@@ -881,6 +887,7 @@ export default class BrainsPlugin extends Plugin {
       }
     } finally {
       this.clearPullStatus();
+      progress.close();
     }
   }
 
@@ -913,6 +920,8 @@ export default class BrainsPlugin extends Plugin {
 
     const base = this.baseUrl();
     const folder = this.settings.vaultFolder;
+    const progress = new SyncProgressModal(this.app, "Push to Brains");
+    progress.open();
 
     try {
       if (!(await this.app.vault.adapter.exists(folder))) {
@@ -933,12 +942,14 @@ export default class BrainsPlugin extends Plugin {
       //    hashes, so we only upload what actually changed. Reading the whole
       //    vault is local + cheap; the expensive part (the server-side diff
       //    scan + import) then runs over a tiny zip instead of all N pages.
+      progress.setMessage("Scanning local files…");
       const hashCache = this.settings.contentHashCache ?? {};
       const currentHashes: Record<string, string> = {};
       const vaultPageNames = new Set<string>();
       const changed: { entryPath: string; content: string }[] = [];
       const changedNames: string[] = [];
-      for (const file of files) {
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
         const content = await this.app.vault.read(file);
         const pageName = this.filePathToPageName(folder, file.path);
         const hash = await sha256Hex(content);
@@ -948,10 +959,15 @@ export default class BrainsPlugin extends Plugin {
           changed.push({ entryPath: file.path.slice(folder.length + 1), content });
           changedNames.push(pageName);
         }
+        if (i % 25 === 0 || i === files.length - 1) {
+          progress.setProgress(i + 1, files.length, `Scanned ${i + 1} / ${files.length}`);
+        }
       }
 
       // 2. Archive set: server pages absent from the vault, minus system pages
       //    a pull never wrote (index/log). Computed regardless of content edits.
+      progress.setMessage("Checking server for removed pages…");
+      progress.setProgress(0, 0);
       const serverPages = await this.listServerPageNames(base, apiKey);
       const toArchive = serverPages.filter(
         (name) => !vaultPageNames.has(name) && !NON_ARCHIVABLE_PAGES.has(name),
@@ -969,16 +985,18 @@ export default class BrainsPlugin extends Plugin {
       let modCount = 0;
       let applied = 0;
 
-      // 3. Preview + import ONLY the changed files (small zip). When only
-      //    archives are pending, skip straight to the confirm.
-      if (changed.length > 0) {
-        const entries: Record<string, Uint8Array> = {};
-        for (const c of changed) entries[c.entryPath] = strToU8(c.content);
-        const zipBytes = zipSync(entries);
+      // 3. Preview ONLY the changed files (small zip). Skipped when nothing
+      //    changed (archive-only push).
+      const entries: Record<string, Uint8Array> = {};
+      for (const c of changed) entries[c.entryPath] = strToU8(c.content);
+      const zipBytes = changed.length > 0 ? zipSync(entries) : null;
 
+      if (zipBytes) {
         // Preview runs as an async job (202 + jobId) on the server to dodge the
-        // Railway gateway timeout; poll for counts. Fall back to a synchronous
-        // { result } body for older servers.
+        // Railway gateway timeout; poll for counts (surfacing job progress).
+        // Fall back to a synchronous { result } body for older servers.
+        progress.setMessage(`Previewing ${changed.length} changed page(s)…`);
+        progress.setProgress(0, 0);
         const preview = await this.uploadZip(base, apiKey, zipBytes, false);
         if (!preview) {
           new Notice("Brains: Push preview failed — no changes made.");
@@ -986,7 +1004,13 @@ export default class BrainsPlugin extends Plugin {
         }
         const previewJobId = (preview as { jobId?: string }).jobId;
         if (previewJobId) {
-          const previewJob = await this.pollJob(base, apiKey, previewJobId);
+          const previewJob = await this.pollJob(base, apiKey, previewJobId, (j) =>
+            progress.setProgress(
+              j.progress?.processed ?? 0,
+              j.progress?.total ?? 0,
+              j.progress?.phase ? `Preview: ${j.progress.phase}` : undefined,
+            ),
+          );
           if (previewJob.status !== "done") {
             new Notice(
               `Brains: Push preview failed (${previewJob.error ?? "job did not complete"}) — no changes made.`,
@@ -1001,43 +1025,52 @@ export default class BrainsPlugin extends Plugin {
           addCount = previewResult.newCount ?? 0;
           modCount = previewResult.modifiedCount ?? 0;
         }
+      }
 
-        // 4. Dry-run confirm before any destructive (archive) activity.
-        const proceed = await this.confirmSync(addCount, modCount, toArchive.length);
-        if (!proceed) {
-          new Notice("Brains: Push cancelled — no changes made.");
-          return;
-        }
+      // 4. Confirm before any destructive activity. Close the progress modal
+      //    while the user decides, then reopen it for the work phase.
+      progress.close();
+      const proceed = await this.confirmSync(addCount, modCount, toArchive.length);
+      if (!proceed) {
+        new Notice("Brains: Push cancelled — no changes made.");
+        return;
+      }
+      progress.open();
 
-        // 5. Execute the import (additive, overwrite). If it fails we STOP
-        //    before archiving anything: no partial replace.
+      // 5. Execute the import of changed files. If it fails we STOP before
+      //    archiving anything: no partial replace.
+      if (zipBytes) {
+        progress.setMessage("Importing changes…");
+        progress.setProgress(0, 0);
         const execResp = await this.uploadZip(base, apiKey, zipBytes, true);
         const jobId = (execResp as { jobId?: string } | null)?.jobId;
         if (!jobId) {
           new Notice("Brains: Push failed — server did not start the import job. No changes made.");
           return;
         }
-        const job = await this.pollJob(base, apiKey, jobId);
+        const job = await this.pollJob(base, apiKey, jobId, (j) =>
+          progress.setProgress(
+            j.progress?.processed ?? 0,
+            j.progress?.total ?? 0,
+            j.progress?.phase ? `Import: ${j.progress.phase}` : undefined,
+          ),
+        );
         if (job.status !== "done" || job.result?.success === false) {
           const reason = job.error ?? `${job.result?.failedCount ?? 0} page(s) failed`;
           new Notice(`Brains: Import failed (${reason}). Nothing archived — push aborted.`, 10000);
           return;
         }
         applied = job.result?.appliedCount ?? addCount + modCount;
-      } else {
-        // Only archives pending — still confirm before destructive activity.
-        const proceed = await this.confirmSync(0, 0, toArchive.length);
-        if (!proceed) {
-          new Notice("Brains: Push cancelled — no changes made.");
-          return;
-        }
       }
 
       // 6. Archive removed pages. Reversible (move to history/), so a per-page
       //    failure here loses nothing — it is reported, not fatal.
       const archived: string[] = [];
       const archiveFailures: string[] = [];
-      for (const name of toArchive) {
+      if (toArchive.length > 0) progress.setMessage("Archiving removed pages…");
+      for (let i = 0; i < toArchive.length; i++) {
+        const name = toArchive[i];
+        progress.setProgress(i + 1, toArchive.length, `${i + 1} / ${toArchive.length}`);
         try {
           const resp = await requestUrl({
             url: `${base}/api/v1/page/move`,
@@ -1053,24 +1086,35 @@ export default class BrainsPlugin extends Plugin {
         }
       }
 
-      // 7. Audit the index (cleanup ghost rows / unindexed pages). Best-effort.
-      let auditNote = "";
-      try {
-        const auditResp = await requestUrl({
-          url: `${base}/api/v1/audit`,
-          method: "POST",
-          headers: this.apiHeaders(apiKey),
-          throw: false,
-          body: JSON.stringify({ cleanup: true }),
-        } as RequestUrlParam);
-        auditNote = auditResp.status === 200 ? "audit ok" : `audit HTTP ${auditResp.status}`;
-      } catch (auditErr) {
-        auditNote = `audit error: ${(auditErr as Error).message}`;
+      // 7. Audit the index (cleanup ghost rows / unindexed pages). Only run it
+      //    when pages were archived — it scans the whole index and can be slow
+      //    (it currently 502s past the gateway timeout on large wikis), so we
+      //    skip it for ordinary content pushes and bound it when it does run.
+      //    Best-effort either way.
+      let auditNote = "skipped";
+      if (archived.length > 0) {
+        progress.setMessage("Auditing index…");
+        progress.setProgress(0, 0);
+        try {
+          const auditResp = await requestUrl({
+            url: `${base}/api/v1/audit`,
+            method: "POST",
+            headers: this.apiHeaders(apiKey),
+            throw: false,
+            timeout: 15_000,
+            body: JSON.stringify({ cleanup: true }),
+          } as RequestUrlParam);
+          auditNote = auditResp.status === 200 ? "audit ok" : `audit HTTP ${auditResp.status}`;
+        } catch (auditErr) {
+          auditNote = `audit error: ${(auditErr as Error).message}`;
+        }
       }
 
       // 8. Persist the new hash baseline so the next push only sees later edits.
       //    currentHashes already reflects the post-push server state (changed
       //    files were just uploaded; the rest were identical).
+      progress.setMessage("Finishing…");
+      progress.setProgress(0, 0);
       this.settings.contentHashCache = currentHashes;
       await this.saveSettings();
 
@@ -1102,6 +1146,8 @@ export default class BrainsPlugin extends Plugin {
       this.showSyncLog(`Push complete — ${summary.join(", ")}`, applied, files.length, detail);
     } catch (err) {
       new Notice(`Brains: Push error — ${(err as Error).message}`);
+    } finally {
+      progress.close();
     }
   }
 
@@ -1292,6 +1338,7 @@ export default class BrainsPlugin extends Plugin {
     base: string,
     apiKey: string,
     jobId: string,
+    onProgress?: (job: BrainsJob) => void,
     maxAttempts = 600,
     intervalMs = 500,
   ): Promise<BrainsJob> {
@@ -1306,6 +1353,7 @@ export default class BrainsPlugin extends Plugin {
           (resp.json as BrainsEnvelope<BrainsJob>)?.result ??
           (resp.json as { job?: BrainsJob })?.job ??
           {};
+        onProgress?.(job);
         if (job.status === "done" || job.status === "failed") return job;
       }
       await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
@@ -1403,6 +1451,7 @@ export default class BrainsPlugin extends Plugin {
   private async downloadExportZipWithRetry(
     base: string,
     apiKey: string,
+    progress?: SyncProgressModal,
   ): Promise<{ ok: true; bytes: Uint8Array } | { ok: false; status?: number; error?: string }> {
     let lastError: string | undefined;
     let lastStatus: number | undefined;
@@ -1425,11 +1474,19 @@ export default class BrainsPlugin extends Plugin {
             lastStatus = 202;
             return { ok: false, status: 202 };
           }
-          const job = await this.pollJob(base, apiKey, body.jobId);
+          const job = await this.pollJob(base, apiKey, body.jobId, (j) =>
+            progress?.setProgress(
+              j.progress?.processed ?? 0,
+              j.progress?.total ?? 0,
+              j.progress?.phase ? `Export: ${j.progress.phase}` : "Preparing export…",
+            ),
+          );
           if (job.status !== "done") {
             lastError = job.error ?? "export job did not complete";
             return { ok: false, error: lastError };
           }
+          progress?.setMessage("Downloading export…");
+          progress?.setProgress(0, 0);
           const downloadPath =
             body.downloadUrl ?? `/api/v1/jobs/${body.jobId}/download`;
           const dlResp = await requestUrl({
@@ -1467,9 +1524,12 @@ export default class BrainsPlugin extends Plugin {
     apiKey: string,
     folder: string,
     log: string[],
+    progress?: SyncProgressModal,
   ): Promise<{ written: number; total: number; revisions: Record<string, string> }> {
     this.setPullStatus("Brains: Pulling… (bootstrap export)");
-    const dl = await this.downloadExportZipWithRetry(base, apiKey);
+    progress?.setMessage("Preparing full export on the server…");
+    progress?.setProgress(0, 0);
+    const dl = await this.downloadExportZipWithRetry(base, apiKey, progress);
     if (!dl.ok) {
       if (dl.status) new Notice(`Brains: Pull failed — server returned ${dl.status}.`);
       else new Notice(`Brains: Pull error — ${dl.error ?? "download failed"}`);
@@ -1489,9 +1549,13 @@ export default class BrainsPlugin extends Plugin {
 
     let written = 0;
     const hashes: Record<string, string> = {};
+    progress?.setMessage("Writing pages to the vault…");
     for (let i = 0; i < pageNames.length; i++) {
       const name = pageNames[i];
       this.setPullStatus(`Brains: Pulling… (bootstrap ${i + 1}/${pageNames.length})`);
+      if (i % 25 === 0 || i === pageNames.length - 1) {
+        progress?.setProgress(i + 1, pageNames.length, `${i + 1} / ${pageNames.length}`);
+      }
       try {
         const content = strFromU8(entries[name]);
         const filePath = `${folder}/${name}`;
@@ -1835,5 +1899,59 @@ class SyncConfirmModal extends Modal {
     this.contentEl.empty();
     // Closing via Esc / click-outside counts as cancel.
     if (!this.resolved) this.done(false);
+  }
+}
+
+/**
+ * Lightweight progress modal shown during Pull/Push. Displays a step message
+ * and a determinate bar driven by async-job progress where available.
+ */
+class SyncProgressModal extends Modal {
+  private messageEl: HTMLElement | null = null;
+  private barEl: HTMLElement | null = null;
+  private detailEl: HTMLElement | null = null;
+
+  constructor(
+    app: App,
+    private heading: string,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.createEl("h2", { text: this.heading });
+    this.messageEl = contentEl.createEl("p", { text: "Starting…" });
+    const wrap = contentEl.createDiv();
+    wrap.style.cssText =
+      "height:8px;background:var(--background-modifier-border);border-radius:4px;overflow:hidden;margin:8px 0;";
+    this.barEl = wrap.createDiv();
+    this.barEl.style.cssText =
+      "height:100%;width:0%;background:var(--interactive-accent);transition:width .2s;";
+    this.detailEl = contentEl.createEl("p", { text: "" });
+    this.detailEl.style.cssText =
+      "color:var(--text-muted);font-size:var(--font-ui-smaller);margin:0;";
+  }
+
+  setMessage(text: string): void {
+    if (this.messageEl) this.messageEl.setText(text);
+  }
+
+  /** Set a determinate bar; pass total<=0 for an indeterminate (full-width pulse). */
+  setProgress(processed: number, total: number, detail?: string): void {
+    if (this.barEl) {
+      const pct = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 100;
+      this.barEl.style.width = `${pct}%`;
+      this.barEl.style.opacity = total > 0 ? "1" : "0.5";
+    }
+    if (this.detailEl) {
+      this.detailEl.setText(
+        detail ?? (total > 0 ? `${processed} / ${total}` : ""),
+      );
+    }
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
   }
 }
