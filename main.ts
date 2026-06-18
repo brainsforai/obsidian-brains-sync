@@ -2,6 +2,7 @@ import {
   App,
   Modal,
   Notice,
+  Platform,
   Plugin,
   PluginSettingTab,
   Setting,
@@ -617,7 +618,15 @@ export default class BrainsPlugin extends Plugin {
       `&scope=${encodeURIComponent(OAUTH_SCOPE)}` +
       `&state=${encodeURIComponent(state)}`;
 
-    window.open(url, "_blank");
+    // iOS WKWebView blocks window.open() (popup blocker), and the preceding
+    // awaits consume the user-gesture so even a "_blank" target is dropped.
+    // On mobile, navigate the frame instead — Obsidian hands external https
+    // URLs to the system browser (Safari). Desktop keeps the popup.
+    if (Platform.isMobile) {
+      window.location.assign(url);
+    } else {
+      window.open(url, "_blank");
+    }
     new Notice("Brains: complete sign-in in your browser, then return to Obsidian.");
   }
 
