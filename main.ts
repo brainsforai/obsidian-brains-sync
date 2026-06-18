@@ -991,11 +991,20 @@ export default class BrainsPlugin extends Plugin {
 
       // 2. Archive set: server pages absent from the vault, minus system pages
       //    a pull never wrote (index/log). Computed regardless of content edits.
+      //    Safety guard: only archive pages that appear in revisionCache — i.e.
+      //    pages the client has actually pulled before. A page missing locally
+      //    but unknown to the cache was never synced here (stale/partial vault),
+      //    so archiving it would be data loss. A genuine delete/move leaves the
+      //    old name in the cache → still archived correctly.
       progress.setMessage("Checking server for removed pages…");
       progress.setProgress(0, 0);
       const serverPages = await this.listServerPageNames(base, apiKey);
+      const knownPages = this.settings.revisionCache ?? {};
       const toArchive = serverPages.filter(
-        (name) => !vaultPageNames.has(name) && !NON_ARCHIVABLE_PAGES.has(name),
+        (name) =>
+          !vaultPageNames.has(name) &&
+          !NON_ARCHIVABLE_PAGES.has(name) &&
+          Object.prototype.hasOwnProperty.call(knownPages, name),
       );
 
       // Nothing changed and nothing to archive → no server scan needed.
