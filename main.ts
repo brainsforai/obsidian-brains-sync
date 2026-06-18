@@ -175,6 +175,8 @@ async function pkceChallenge(verifier: string): Promise<string> {
 const POLL_MAX_QUIET = 3;
 const PULL_EXPORT_TIMEOUT_MS = 120_000;
 const PULL_EXPORT_MAX_RETRIES = 3;
+// Concurrent per-page fetches during an incremental pull.
+const PULL_PAGE_CONCURRENCY = 8;
 
 type PollState = {
   path: string;
@@ -853,31 +855,45 @@ export default class BrainsPlugin extends Plugin {
         return;
       }
 
+      // Fetch the changed pages with a small worker pool. Each is a conditional
+      // GET and per-request server latency dominates, so concurrency turns a
+      // slow sequential crawl (N × ~1s) into ~N/POOL batches. (The server's
+      // `?since=` bundle export is not faster here — it rescans the whole wiki.)
       let applied = 0;
+      let completed = 0;
       const nextCache: Record<string, string> = { ...known };
       progress.setMessage(`Pulling ${toFetch.length} changed page(s)…`);
-      for (let i = 0; i < toFetch.length; i++) {
-        const page = toFetch[i];
-        this.setPullStatus(`Brains: Pulling… (${i + 1}/${toFetch.length})`);
-        progress.setProgress(i + 1, toFetch.length, `${i + 1} / ${toFetch.length}`);
-        const res = await this.pullPageByName(
-          page.name,
-          apiKey,
-          base,
-          folder,
-          known[page.name],
-        );
-        if (res.status === "updated" || res.status === "created") {
-          applied++;
-          log.push(`PULL  ${page.name}.md`);
-        } else if (res.status === "conflict") {
-          log.push(`FAIL  ${page.name} (local edits pending)`);
-        } else if (res.status === "error") {
-          log.push(`ERROR ${page.name}: fetch failed`);
+      let cursor = 0;
+      const worker = async (): Promise<void> => {
+        while (cursor < toFetch.length) {
+          const page = toFetch[cursor++];
+          const res = await this.pullPageByName(
+            page.name,
+            apiKey,
+            base,
+            folder,
+            known[page.name],
+          );
+          if (res.status === "updated" || res.status === "created") {
+            applied++;
+            log.push(`PULL  ${page.name}.md`);
+          } else if (res.status === "conflict") {
+            log.push(`FAIL  ${page.name} (local edits pending)`);
+          } else if (res.status === "error") {
+            log.push(`ERROR ${page.name}: fetch failed`);
+          }
+          const rev = res.revision ?? page.revision;
+          if (rev) nextCache[page.name] = rev;
+          completed++;
+          this.setPullStatus(`Brains: Pulling… (${completed}/${toFetch.length})`);
+          progress.setProgress(completed, toFetch.length, `${completed} / ${toFetch.length}`);
         }
-        const rev = res.revision ?? page.revision;
-        if (rev) nextCache[page.name] = rev;
-      }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(PULL_PAGE_CONCURRENCY, toFetch.length) }, () =>
+          worker(),
+        ),
+      );
 
       for (const page of index) {
         if (page.revision) nextCache[page.name] = page.revision;
