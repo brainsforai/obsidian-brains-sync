@@ -1,7 +1,7 @@
 {
   "id": "brains-sync",
   "name": "Brains Sync",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "minAppVersion": "1.11.4",
   "description": "Sync your vault with Brains, the persistent, cross-LLM second brain your AI never had. Pull pages in, edit, and push changes back. One memory for Claude, ChatGPT, and whatever's next.",
   "author": "Brains",
