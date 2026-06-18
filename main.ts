@@ -1756,7 +1756,9 @@ class BrainsSettingTab extends PluginSettingTab {
         if (connected) {
           btn
             .setButtonText("Disconnect")
-            .setDestructive()
+            // setWarning is deprecated in favor of setDestructive, but
+            // setDestructive isn't available at our minAppVersion (1.11.4).
+            .setWarning()
             .onClick(async () => {
               await this.plugin.clearTokens();
               this.display();
