@@ -3,7 +3,7 @@
   "name": "Brains Sync",
   "version": "1.1.0",
   "minAppVersion": "1.11.4",
-  "description": "Sync your Obsidian vault with Brains (usebrains.app), an AI-powered personal wiki. Pull pages into a vault folder and push edits back with one command.",
+  "description": "Sync your vault with Brains, the persistent, cross-LLM second brain your AI never had. Pull pages in, edit, and push changes back. One memory for Claude, ChatGPT, and whatever's next.",
   "author": "Brains",
   "authorUrl": "https://usebrains.app",
   "isDesktopOnly": false
