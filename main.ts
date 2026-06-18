@@ -1742,8 +1742,6 @@ class BrainsSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    new Setting(containerEl).setName("Brains Sync").setHeading();
-
     new Setting(containerEl)
       .setName("Brains instance URL")
       .setDesc("Base URL of your Brains instance (e.g. https://lets.usebrains.app).")
