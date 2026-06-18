@@ -7,6 +7,7 @@ import {
   PluginSettingTab,
   Setting,
   TFile,
+  TFolder,
   debounce,
   requestUrl,
   type RequestUrlParam,
@@ -920,12 +921,29 @@ export default class BrainsPlugin extends Plugin {
     }
   }
 
+  /**
+   * Collect the .md files inside the configured sync folder only, by walking
+   * that folder's subtree. Scoped on purpose: we never enumerate the whole
+   * vault (no `vault.getFiles()`), so the plugin only touches its own folder.
+   */
+  private collectFolderMarkdown(folder: string): TFile[] {
+    const root = this.app.vault.getAbstractFileByPath(folder);
+    if (!(root instanceof TFolder)) return [];
+    const out: TFile[] = [];
+    const walk = (dir: TFolder): void => {
+      for (const child of dir.children) {
+        if (child instanceof TFolder) walk(child);
+        else if (child instanceof TFile && child.extension === "md") out.push(child);
+      }
+    };
+    walk(root);
+    return out;
+  }
+
   /** Hash every synced .md file in the vault folder (pageName -> sha256). */
   private async computeVaultHashes(folder: string): Promise<Record<string, string>> {
     const out: Record<string, string> = {};
-    const files = this.app.vault
-      .getFiles()
-      .filter((f) => f.path.startsWith(folder + "/") && f.extension === "md");
+    const files = this.collectFolderMarkdown(folder);
     for (const file of files) {
       out[this.filePathToPageName(folder, file.path)] = await sha256Hex(
         await this.app.vault.read(file),
@@ -958,9 +976,7 @@ export default class BrainsPlugin extends Plugin {
         return;
       }
 
-      const files = this.app.vault
-        .getFiles()
-        .filter((f) => f.path.startsWith(folder + "/") && f.extension === "md");
+      const files = this.collectFolderMarkdown(folder);
 
       if (files.length === 0) {
         new Notice(`Brains: No markdown files found in "${folder}".`);
