@@ -678,6 +678,9 @@ export default class BrainsPlugin extends Plugin {
         return;
       }
       await this.storeTokens(json);
+      // display() is deprecated since 1.13.0 in favour of getSettingDefinitions(),
+      // but the tab uses imperative rendering; this is the only way to refresh the
+      // account row after OAuth completes.  Revisit when the tab is refactored.
       this.settingsTab?.display();
       new Notice("Brains: sign-in complete — connected ✓");
     } catch (err) {
@@ -1023,8 +1026,10 @@ export default class BrainsPlugin extends Plugin {
       // 3. Preview ONLY the changed files (small zip). Skipped when nothing
       //    changed (archive-only push).
       const entries: Record<string, Uint8Array> = {};
-      for (const c of changed) entries[c.entryPath] = strToU8(c.content);
-      const zipBytes = changed.length > 0 ? zipSync(entries) : null;
+      // strToU8 / zipSync return Uint8Array<ArrayBuffer> in fflate's typings,
+      // which TypeScript 4.x treats as `any`; cast explicitly to keep ESLint happy.
+      for (const c of changed) entries[c.entryPath] = strToU8(c.content) as Uint8Array;
+      const zipBytes: Uint8Array | null = changed.length > 0 ? zipSync(entries) as Uint8Array : null;
 
       if (zipBytes) {
         // Preview runs as an async job (202 + jobId) on the server to dodge the
@@ -1592,7 +1597,8 @@ export default class BrainsPlugin extends Plugin {
         progress?.setProgress(i + 1, pageNames.length, `${i + 1} / ${pageNames.length}`);
       }
       try {
-        const content = strFromU8(entries[name]);
+        // entries[name] is Uint8Array<ArrayBuffer> in fflate typings (any in TS 4.x).
+        const content = strFromU8(entries[name] as Uint8Array);
         const filePath = `${folder}/${name}`;
         await this.ensureParentDirs(filePath);
         this.suppressModify.add(filePath);
@@ -1770,6 +1776,9 @@ class BrainsSettingTab extends PluginSettingTab {
             .setWarning()
             .onClick(async () => {
               await this.plugin.clearTokens();
+              // display() is deprecated since 1.13.0 in favour of getSettingDefinitions(),
+              // but the tab uses imperative rendering; this is the only way to refresh the
+              // account row after disconnect.  Revisit when the tab is refactored.
               this.display();
             });
         } else {
