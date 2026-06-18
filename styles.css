@@ -1,0 +1,28 @@
+/* Status bar: hide the pull-status element when idle */
+.brains-pull-status-hidden {
+    display: none;
+}
+
+/* SyncProgressModal: progress bar container */
+.brains-progress-wrap {
+    height: 8px;
+    background: var(--background-modifier-border);
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 8px 0;
+}
+
+/* SyncProgressModal: progress bar fill */
+.brains-progress-bar {
+    height: 100%;
+    width: 0%;
+    background: var(--interactive-accent);
+    transition: width .2s;
+}
+
+/* SyncProgressModal: progress bar detail text */
+.brains-progress-detail {
+    color: var(--text-muted);
+    font-size: var(--font-ui-smaller);
+    margin: 0;
+}

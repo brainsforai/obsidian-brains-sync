@@ -10,6 +10,7 @@ import {
   debounce,
   requestUrl,
   type RequestUrlParam,
+  type RequestUrlResponse,
 } from "obsidian";
 import { unzipSync, zipSync, strToU8, strFromU8 } from "fflate";
 
@@ -206,7 +207,7 @@ export default class BrainsPlugin extends Plugin {
 
     // Ribbon icon — quick access to Pull
     this.addRibbonIcon("download", "Pull from Brains", () => {
-      this.pullFromBrains();
+      void this.pullFromBrains();
     });
 
     // Command: Pull from Brains
@@ -247,7 +248,7 @@ export default class BrainsPlugin extends Plugin {
     this.addSettingTab(this.settingsTab);
     this.pullStatusEl = this.addStatusBarItem();
     this.pullStatusEl.setText("");
-    this.pullStatusEl.style.display = "none";
+    this.pullStatusEl.addClass("brains-pull-status-hidden");
 
     // --- Auto-sync wiring ---------------------------------------------------
     // Typing and saves both mark the file dirty and (re)arm the push debounce.
@@ -495,7 +496,7 @@ export default class BrainsPlugin extends Plugin {
   // -------------------------------------------------------------------------
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, (await this.loadData()) as Partial<BrainsSettings> | null | undefined);
   }
 
   async saveSettings() {
@@ -781,14 +782,14 @@ export default class BrainsPlugin extends Plugin {
 
   private setPullStatus(text: string): void {
     if (!this.pullStatusEl) return;
-    this.pullStatusEl.style.display = "";
+    this.pullStatusEl.removeClass("brains-pull-status-hidden");
     this.pullStatusEl.setText(text);
   }
 
   private clearPullStatus(): void {
     if (!this.pullStatusEl) return;
     this.pullStatusEl.setText("");
-    this.pullStatusEl.style.display = "none";
+    this.pullStatusEl.addClass("brains-pull-status-hidden");
   }
 
   // -------------------------------------------------------------------------
@@ -1200,7 +1201,7 @@ export default class BrainsPlugin extends Plugin {
         throw: false,
       } as RequestUrlParam);
 
-      let resp;
+      let resp: RequestUrlResponse;
       if (readResp.status === 200) {
         const read = (
           readResp.json as BrainsEnvelope<BrainsPageRead> | null
@@ -1381,7 +1382,7 @@ export default class BrainsPlugin extends Plugin {
         onProgress?.(job);
         if (job.status === "done" || job.status === "failed") return job;
       }
-      await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+      await new Promise<void>((resolve) => window.setTimeout(resolve, intervalMs));
     }
     return { status: "failed", error: "timed out waiting for import job" };
   }
@@ -1393,7 +1394,7 @@ export default class BrainsPlugin extends Plugin {
       | BrainsPage[];
     if (Array.isArray(body)) return body;
     if ("result" in body && body.result) {
-      const r = body.result as BrainsPageList | BrainsPage[];
+      const r = body.result;
       return Array.isArray(r) ? r : (r.pages ?? []);
     }
     return (body as { pages?: BrainsPage[] }).pages ?? [];
@@ -1539,7 +1540,7 @@ export default class BrainsPlugin extends Plugin {
           return { ok: false, error: lastError };
         }
       }
-      await new Promise<void>((resolve) => setTimeout(resolve, 600 * attempt));
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 600 * attempt));
     }
     return { ok: false, status: lastStatus, error: lastError };
   }
@@ -1726,7 +1727,7 @@ class BrainsSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "Brains Sync" });
+    new Setting(containerEl).setName("Brains Sync").setHeading();
 
     new Setting(containerEl)
       .setName("Brains instance URL")
@@ -1755,6 +1756,8 @@ class BrainsSettingTab extends PluginSettingTab {
         if (connected) {
           btn
             .setButtonText("Disconnect")
+            // setWarning is deprecated in favor of setDestructive, but
+            // setDestructive isn't available at our minAppVersion (1.11.4).
             .setWarning()
             .onClick(async () => {
               await this.plugin.clearTokens();
@@ -1785,7 +1788,7 @@ class BrainsSettingTab extends PluginSettingTab {
       );
 
     // --- Auto-sync ---
-    containerEl.createEl("h3", { text: "Auto-sync" });
+    new Setting(containerEl).setName("Auto-sync").setHeading();
 
     new Setting(containerEl)
       .setName("Auto-push on edit")
@@ -1843,7 +1846,7 @@ class BrainsSettingTab extends PluginSettingTab {
       );
 
     // --- Advanced: manual token fallback (self-hosters / non-OAuth setups) ---
-    containerEl.createEl("h3", { text: "Advanced" });
+    new Setting(containerEl).setName("Advanced").setHeading();
 
     new Setting(containerEl)
       .setName("API token (fallback)")
@@ -1947,15 +1950,9 @@ class SyncProgressModal extends Modal {
     const { contentEl } = this;
     contentEl.createEl("h2", { text: this.heading });
     this.messageEl = contentEl.createEl("p", { text: "Starting…" });
-    const wrap = contentEl.createDiv();
-    wrap.style.cssText =
-      "height:8px;background:var(--background-modifier-border);border-radius:4px;overflow:hidden;margin:8px 0;";
-    this.barEl = wrap.createDiv();
-    this.barEl.style.cssText =
-      "height:100%;width:0%;background:var(--interactive-accent);transition:width .2s;";
-    this.detailEl = contentEl.createEl("p", { text: "" });
-    this.detailEl.style.cssText =
-      "color:var(--text-muted);font-size:var(--font-ui-smaller);margin:0;";
+    const wrap = contentEl.createDiv({ cls: "brains-progress-wrap" });
+    this.barEl = wrap.createDiv({ cls: "brains-progress-bar" });
+    this.detailEl = contentEl.createEl("p", { text: "", cls: "brains-progress-detail" });
   }
 
   setMessage(text: string): void {
