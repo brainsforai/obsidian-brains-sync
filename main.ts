@@ -14,6 +14,8 @@ import {
   type RequestUrlResponse,
 } from "obsidian";
 import { unzipSync, zipSync, strToU8, strFromU8 } from "fflate";
+import { decidePullOutcome } from "./src/conflictResolution";
+import { filePathToPageName, pageNameToTitle, pageToFilePath } from "./src/pathMapping";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -414,8 +416,13 @@ export default class BrainsPlugin extends Plugin {
       const revision = remote?.revision;
       const localContent = await this.app.vault.read(file);
 
-      if (remoteContent === localContent) return { status: "unchanged", revision };
-      if (this.dirtyFiles.has(file.path)) {
+      const outcome = decidePullOutcome({
+        localContent,
+        remoteContent,
+        isDirty: this.dirtyFiles.has(file.path),
+      });
+      if (outcome === "unchanged") return { status: "unchanged", revision };
+      if (outcome === "conflict") {
         const conflictPath = await this.writeConflictCopy(file.path, remoteContent);
         return { status: "conflict", revision, conflictPath: conflictPath ?? undefined };
       }
@@ -1337,22 +1344,17 @@ export default class BrainsPlugin extends Plugin {
 
   /** Convert a Brains page name (e.g. "projects/foo/bar") to a vault file path. */
   private pageToFilePath(folder: string, name: string): string {
-    const normalized = name.endsWith(".md") ? name : `${name}.md`;
-    return `${folder}/${normalized}`;
+    return pageToFilePath(folder, name);
   }
 
   /** Convert a vault file path back to a Brains page name (no extension). */
   private filePathToPageName(folder: string, filePath: string): string {
-    let name = filePath.slice(folder.length + 1); // strip "folder/"
-    if (name.endsWith(".md")) name = name.slice(0, -3);
-    return name;
+    return filePathToPageName(folder, filePath);
   }
 
   /** Derive a human title from a page name's final path segment. */
   private pageNameToTitle(pageName: string): string {
-    const last = pageName.split("/").pop() ?? pageName;
-    const cleaned = last.replace(/[-_]+/g, " ").trim();
-    return cleaned.length > 0 ? cleaned : pageName;
+    return pageNameToTitle(pageName);
   }
 
   /** Ensure every intermediate directory in a file path exists in the vault. */
@@ -1538,8 +1540,13 @@ export default class BrainsPlugin extends Plugin {
 
       if (existing instanceof TFile) {
         const localContent = await this.app.vault.read(existing);
-        if (remoteContent === localContent) return { status: "unchanged", revision };
-        if (this.dirtyFiles.has(existing.path)) {
+        const outcome = decidePullOutcome({
+          localContent,
+          remoteContent,
+          isDirty: this.dirtyFiles.has(existing.path),
+        });
+        if (outcome === "unchanged") return { status: "unchanged", revision };
+        if (outcome === "conflict") {
           const conflictPath = await this.writeConflictCopy(existing.path, remoteContent);
           return { status: "conflict", revision, conflictPath: conflictPath ?? undefined };
         }
