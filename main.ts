@@ -389,7 +389,12 @@ export default class BrainsPlugin extends Plugin {
     base: string,
     folder: string,
     knownRevision?: string,
-  ): Promise<{ status: "updated" | "unchanged" | "conflict" | "missing" | "error"; revision?: string }> {
+  ): Promise<{
+    status: "updated" | "unchanged" | "conflict" | "missing" | "error";
+    revision?: string;
+    /** Sibling file the server copy was written to, when status is "conflict". */
+    conflictPath?: string;
+  }> {
     const pageName = this.filePathToPageName(folder, file.path);
     try {
       const headers = this.apiHeaders(apiKey);
@@ -410,7 +415,10 @@ export default class BrainsPlugin extends Plugin {
       const localContent = await this.app.vault.read(file);
 
       if (remoteContent === localContent) return { status: "unchanged", revision };
-      if (this.dirtyFiles.has(file.path)) return { status: "conflict", revision };
+      if (this.dirtyFiles.has(file.path)) {
+        const conflictPath = await this.writeConflictCopy(file.path, remoteContent);
+        return { status: "conflict", revision, conflictPath: conflictPath ?? undefined };
+      }
 
       this.suppressModify.add(file.path);
       await this.app.vault.adapter.write(file.path, remoteContent);
@@ -432,7 +440,11 @@ export default class BrainsPlugin extends Plugin {
     const res = await this.pullFile(file, apiKey, this.baseUrl(), this.settings.vaultFolder);
     if (res.status === "updated") new Notice(`Brains: refreshed ${file.name} from server`);
     else if (res.status === "conflict") {
-      new Notice(`Brains: ${file.name} differs on server — local edits pending`);
+      new Notice(
+        res.conflictPath
+          ? `Brains: ${file.name} differs on server — local edits kept, server copy saved as ${res.conflictPath.split("/").pop()}`
+          : `Brains: ${file.name} differs on server — local edits pending`,
+      );
     }
     this.startPoll(file, res.revision);
   }
@@ -1344,6 +1356,41 @@ export default class BrainsPlugin extends Plugin {
   }
 
   /** Ensure every intermediate directory in a file path exists in the vault. */
+  /**
+   * Write the server's copy of a conflicting page to a sibling file rather
+   * than discarding it.
+   *
+   * Ported from the monorepo `obsidian-plugin/pullConflict.ts` (brains PR742 /
+   * GH #645), which was built against a stale fork of this plugin and never
+   * reached the canonical repo. Only the sibling-file behaviour is taken:
+   * detection here stays this plugin's own (content compare + `dirtyFiles`),
+   * which is strictly better than the mtime heuristic that version used.
+   *
+   * Before this, a conflict surfaced as a Notice and the remote content was
+   * dropped on the floor — the user was told their copy differed but had no
+   * way to see how. The local file is still never touched; the remote copy
+   * lands beside it as `<name>.conflict-<ISO>.md` for the user to diff and
+   * delete.
+   *
+   * Returns the path written, or null if the write failed — a failed conflict
+   * copy must degrade to the old notice-only behaviour, never to an exception
+   * that aborts the surrounding pull loop mid-way.
+   */
+  private async writeConflictCopy(filePath: string, remoteContent: string): Promise<string | null> {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const base = filePath.replace(/\.md$/i, "");
+    const conflictPath = `${base}.conflict-${stamp}.md`;
+    try {
+      await this.ensureParentDirs(conflictPath);
+      this.suppressModify.add(conflictPath);
+      await this.app.vault.adapter.write(conflictPath, remoteContent);
+      return conflictPath;
+    } catch {
+      this.suppressModify.delete(conflictPath);
+      return null;
+    }
+  }
+
   private async ensureParentDirs(filePath: string): Promise<void> {
     const parts = filePath.split("/");
     parts.pop(); // remove filename
@@ -1468,6 +1515,8 @@ export default class BrainsPlugin extends Plugin {
   ): Promise<{
     status: "updated" | "created" | "unchanged" | "conflict" | "missing" | "error";
     revision?: string;
+    /** Sibling file the server copy was written to, when status is "conflict". */
+    conflictPath?: string;
   }> {
     try {
       const headers = this.apiHeaders(apiKey);
@@ -1490,7 +1539,10 @@ export default class BrainsPlugin extends Plugin {
       if (existing instanceof TFile) {
         const localContent = await this.app.vault.read(existing);
         if (remoteContent === localContent) return { status: "unchanged", revision };
-        if (this.dirtyFiles.has(existing.path)) return { status: "conflict", revision };
+        if (this.dirtyFiles.has(existing.path)) {
+          const conflictPath = await this.writeConflictCopy(existing.path, remoteContent);
+          return { status: "conflict", revision, conflictPath: conflictPath ?? undefined };
+        }
         this.suppressModify.add(existing.path);
         await this.app.vault.adapter.write(existing.path, remoteContent);
         return { status: "updated", revision };
