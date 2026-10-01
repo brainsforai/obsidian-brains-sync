@@ -18,6 +18,7 @@ import { decidePullOutcome } from "./src/conflictResolution";
 import { filePathToPageName, pageNameToTitle, pageToFilePath } from "./src/pathMapping";
 import { decidePushOutcome, type PushOutcome } from "./src/pushOutcome";
 import { isPageDirty } from "./src/syncState";
+import { isClientIdValidForInstance, isUnknownClientIdError } from "./src/oauthClientId";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -28,6 +29,7 @@ interface BrainsSettings {
   vaultFolder: string;
   // OAuth2/PKCE state (non-secret; tokens live in SecretStorage).
   oauthClientId?: string;
+  oauthClientInstanceUrl?: string; // instance that issued oauthClientId; a mismatch means "no client id"
   tokenExpiresAt?: number; // epoch ms when the access token should be refreshed
   // Auto-sync
   autoPush: boolean; // push edited files after a quiet period
@@ -532,6 +534,9 @@ export default class BrainsPlugin extends Plugin {
   // In-memory PKCE state for an in-progress authorization (not persisted; a
   // mid-flow plugin reload simply requires re-clicking Connect).
   private pendingAuth: { verifier: string; state: string } | null = null;
+  // Guards the "Unknown client_id" recovery path so a repeatedly-rejecting
+  // server triggers one re-registration attempt, not a retry loop.
+  private clientIdRecoveryAttempted = false;
 
   // -------------------------------------------------------------------------
   // Settings persistence
@@ -608,12 +613,25 @@ export default class BrainsPlugin extends Plugin {
     return this.getApiKey();
   }
 
-  /** Register a dynamic OAuth client once and cache the client_id in settings. */
+  /**
+   * Register a dynamic OAuth client and cache the client_id in settings,
+   * keyed to the instance that issued it. OAuth client registrations are
+   * per-instance, so a cached id whose instance no longer matches the
+   * configured instanceUrl is treated as "no client id" and replaced.
+   */
   private async ensureClientId(): Promise<string | null> {
-    if (this.settings.oauthClientId) return this.settings.oauthClientId;
+    const instance = this.baseUrl();
+    if (
+      isClientIdValidForInstance(
+        { clientId: this.settings.oauthClientId, instanceUrl: this.settings.oauthClientInstanceUrl },
+        instance,
+      )
+    ) {
+      return this.settings.oauthClientId as string;
+    }
     try {
       const resp = await requestUrl({
-        url: `${this.baseUrl()}/oauth/register`,
+        url: `${instance}/oauth/register`,
         method: "POST",
         headers: { "Content-Type": "application/json" },
         throw: false,
@@ -623,20 +641,48 @@ export default class BrainsPlugin extends Plugin {
         }),
       } as RequestUrlParam);
       if (resp.status !== 200 && resp.status !== 201) {
-        new Notice(`Brains: client registration failed (HTTP ${resp.status}).`);
+        new Notice(`Brains: client registration with ${instance} failed (HTTP ${resp.status}).`);
         return null;
       }
       const clientId = (resp.json as { client_id?: string })?.client_id;
       if (!clientId) {
-        new Notice("Brains: registration returned no client_id.");
+        new Notice(`Brains: ${instance} returned no client_id during registration.`);
         return null;
       }
       this.settings.oauthClientId = clientId;
+      this.settings.oauthClientInstanceUrl = instance;
       await this.saveSettings();
       return clientId;
     } catch (err) {
-      new Notice(`Brains: registration error — ${(err as Error).message}`);
+      new Notice(`Brains: registration with ${instance} failed — ${(err as Error).message}`);
       return null;
+    }
+  }
+
+  /**
+   * Recover from a server reporting our cached client_id as unrecognized —
+   * the server likely lost its client table, or we're pointed at an
+   * instance that never issued this id. Drop the stale id and tokens, and
+   * make exactly one automatic re-registration attempt against the current
+   * instance (never retried again until a sign-in succeeds).
+   */
+  private async recoverFromUnknownClientId(): Promise<void> {
+    const instance = this.baseUrl();
+    this.settings.oauthClientId = undefined;
+    this.settings.oauthClientInstanceUrl = undefined;
+    await this.clearTokens();
+
+    if (this.clientIdRecoveryAttempted) {
+      new Notice(`Brains: ${instance} does not recognize this client — run "Connect to Brains" again.`);
+      return;
+    }
+    this.clientIdRecoveryAttempted = true;
+
+    const clientId = await this.ensureClientId();
+    if (clientId) {
+      new Notice(`Brains: ${instance} issued a new client — run "Connect to Brains" again to sign in.`);
+    } else {
+      new Notice(`Brains: ${instance} does not recognize this client, and re-registration failed.`);
     }
   }
 
@@ -714,8 +760,12 @@ export default class BrainsPlugin extends Plugin {
       } as RequestUrlParam);
       const json = resp.json as BrainsTokenResponse | null;
       if (resp.status !== 200 || !json?.access_token) {
+        if (isUnknownClientIdError(json)) {
+          await this.recoverFromUnknownClientId();
+          return;
+        }
         new Notice(
-          `Brains: token exchange failed — ${json?.error_description ?? json?.error ?? `HTTP ${resp.status}`}.`,
+          `Brains: sign-in to ${this.baseUrl()} failed — ${json?.error_description ?? json?.error ?? `HTTP ${resp.status}`}.`,
         );
         return;
       }
@@ -754,6 +804,10 @@ export default class BrainsPlugin extends Plugin {
       } as RequestUrlParam);
       const json = resp.json as BrainsTokenResponse | null;
       if (resp.status !== 200 || !json?.access_token) {
+        if (isUnknownClientIdError(json)) {
+          await this.recoverFromUnknownClientId();
+          return false;
+        }
         // Refresh token is dead — clear it so the UI prompts a re-connect.
         await this.clearTokens();
         return false;
@@ -774,6 +828,7 @@ export default class BrainsPlugin extends Plugin {
     if (t.refresh_token) await this.writeSecret(SECRET_REFRESH, t.refresh_token);
     const ttl = typeof t.expires_in === "number" ? t.expires_in : 3600;
     this.settings.tokenExpiresAt = Date.now() + Math.max(0, ttl - 60) * 1000;
+    this.clientIdRecoveryAttempted = false;
     await this.saveSettings();
   }
 
