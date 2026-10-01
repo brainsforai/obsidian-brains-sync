@@ -16,6 +16,7 @@ import {
 import { unzipSync, zipSync, strToU8, strFromU8 } from "fflate";
 import { decidePullOutcome } from "./src/conflictResolution";
 import { filePathToPageName, pageNameToTitle, pageToFilePath } from "./src/pathMapping";
+import { decidePushOutcome, type PushOutcome } from "./src/pushOutcome";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1057,6 +1058,7 @@ export default class BrainsPlugin extends Plugin {
       let addCount = 0;
       let modCount = 0;
       let applied = 0;
+      let pushOutcome: PushOutcome | null = null;
 
       // 3. Preview ONLY the changed files (small zip). Skipped when nothing
       //    changed (archive-only push).
@@ -1130,12 +1132,22 @@ export default class BrainsPlugin extends Plugin {
             j.progress?.phase ? `Import: ${j.progress.phase}` : undefined,
           ),
         );
-        if (job.status !== "done" || job.result?.success === false) {
-          const reason = job.error ?? `${job.result?.failedCount ?? 0} page(s) failed`;
+        if (job.status !== "done") {
+          new Notice(`Brains: Import failed (${job.error ?? "job did not complete"}). Nothing archived — push aborted.`, 10000);
+          return;
+        }
+        // GH #1047: derive the outcome strictly from the job's own result —
+        // never from addCount/modCount (what the push INTENDED to write).
+        // A job that completes "done" with appliedCount 0 while pages were
+        // meant to change is a failed push, even if nothing set success:false.
+        pushOutcome = decidePushOutcome(job.result, changed.length);
+        if (job.result?.success === false || pushOutcome.allFailed) {
+          const reason = job.error
+            ?? (pushOutcome.failureLines.length > 0 ? pushOutcome.failureLines.join("; ") : `${pushOutcome.skippedCount} page(s) skipped, 0 applied`);
           new Notice(`Brains: Import failed (${reason}). Nothing archived — push aborted.`, 10000);
           return;
         }
-        applied = job.result?.appliedCount ?? addCount + modCount;
+        applied = pushOutcome.appliedCount;
       }
 
       // 6. Archive removed pages. Reversible (move to history/), so a per-page
@@ -1213,8 +1225,10 @@ export default class BrainsPlugin extends Plugin {
         `${archived.length} archived`,
       ];
       if (archiveFailures.length > 0) summary.push(`${archiveFailures.length} archive failures`);
+      if (pushOutcome && pushOutcome.skippedCount > 0) summary.push(`${pushOutcome.skippedCount} skipped`);
       const detail = [
         `Applied ${applied} page(s). ${auditNote}.`,
+        ...(pushOutcome?.failureLines.map((l) => `FAIL    ${l}`) ?? []),
         ...archived.map((n) => `ARCHIVE ${n}`),
         ...archiveFailures.map((n) => `FAIL    ${n}`),
       ];
