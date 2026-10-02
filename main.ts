@@ -17,6 +17,7 @@ import { unzipSync, zipSync, strToU8, strFromU8 } from "fflate";
 import { decidePullOutcome } from "./src/conflictResolution";
 import { filePathToPageName, pageNameToTitle, pageToFilePath } from "./src/pathMapping";
 import { decidePushOutcome, type PushOutcome } from "./src/pushOutcome";
+import { isPageDirty } from "./src/syncState";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -35,6 +36,7 @@ interface BrainsSettings {
   pollIntervalMin: number; // minutes between freshness polls of the open note
   revisionCache?: Record<string, string>; // pageName -> server revision seen on pull
   contentHashCache?: Record<string, string>; // pageName -> sha256 of last-synced local content (delta push)
+  syncedMtimeCache?: Record<string, number>; // pageName -> local file mtime as of the last time we know it matched the server; survives a restart, unlike dirtyFiles
 }
 
 const DEFAULT_SETTINGS: BrainsSettings = {
@@ -330,6 +332,23 @@ export default class BrainsPlugin extends Plugin {
     this.autoPushDebouncer();
   }
 
+  /** True if `pageName` has pending local edits a pull must not overwrite. See src/syncState.ts. */
+  private isPageDirty(path: string, pageName: string, currentMtime: number): boolean {
+    return isPageDirty({
+      inMemoryDirty: this.dirtyFiles.has(path),
+      syncedMtime: this.settings.syncedMtimeCache?.[pageName],
+      currentMtime,
+    });
+  }
+
+  /** Record that `path` now matches the server, so a later pull (even after a restart) doesn't mistake this write for a pending edit. */
+  private async recordSyncedWrite(pageName: string, path: string): Promise<void> {
+    const stat = await this.app.vault.adapter.stat(path);
+    if (!stat) return;
+    if (!this.settings.syncedMtimeCache) this.settings.syncedMtimeCache = {};
+    this.settings.syncedMtimeCache[pageName] = stat.mtime;
+  }
+
   /** Push everything that has gone quiet since the last edit. */
   private async flushAutoPush(): Promise<void> {
     if (this.dirtyFiles.size === 0) return;
@@ -420,7 +439,7 @@ export default class BrainsPlugin extends Plugin {
       const outcome = decidePullOutcome({
         localContent,
         remoteContent,
-        isDirty: this.dirtyFiles.has(file.path),
+        isDirty: this.isPageDirty(file.path, pageName, file.stat.mtime),
       });
       if (outcome === "unchanged") return { status: "unchanged", revision };
       if (outcome === "conflict") {
@@ -430,6 +449,8 @@ export default class BrainsPlugin extends Plugin {
 
       this.suppressModify.add(file.path);
       await this.app.vault.adapter.write(file.path, remoteContent);
+      await this.recordSyncedWrite(pageName, file.path);
+      await this.saveSettings();
       return { status: "updated", revision };
     } catch {
       return { status: "error" };
@@ -1557,7 +1578,7 @@ export default class BrainsPlugin extends Plugin {
         const outcome = decidePullOutcome({
           localContent,
           remoteContent,
-          isDirty: this.dirtyFiles.has(existing.path),
+          isDirty: this.isPageDirty(existing.path, pageName, existing.stat.mtime),
         });
         if (outcome === "unchanged") return { status: "unchanged", revision };
         if (outcome === "conflict") {
@@ -1566,11 +1587,15 @@ export default class BrainsPlugin extends Plugin {
         }
         this.suppressModify.add(existing.path);
         await this.app.vault.adapter.write(existing.path, remoteContent);
+        await this.recordSyncedWrite(pageName, existing.path);
+        await this.saveSettings();
         return { status: "updated", revision };
       }
 
       await this.ensureParentDirs(filePath);
       await this.app.vault.create(filePath, remoteContent);
+      await this.recordSyncedWrite(pageName, filePath);
+      await this.saveSettings();
       return { status: "created", revision };
     } catch {
       return { status: "error" };
@@ -1678,6 +1703,7 @@ export default class BrainsPlugin extends Plugin {
 
     let written = 0;
     const hashes: Record<string, string> = {};
+    const mtimes: Record<string, number> = {};
     progress?.setMessage("Writing pages to the vault…");
     for (let i = 0; i < pageNames.length; i++) {
       const name = pageNames[i];
@@ -1689,18 +1715,24 @@ export default class BrainsPlugin extends Plugin {
         // entries[name] is Uint8Array<ArrayBuffer> in fflate typings (any in TS 4.x).
         const content = strFromU8(entries[name] as Uint8Array);
         const filePath = `${folder}/${name}`;
+        const pageName = name.replace(/\.md$/, "");
         await this.ensureParentDirs(filePath);
         this.suppressModify.add(filePath);
         await this.app.vault.adapter.write(filePath, content);
-        hashes[name.replace(/\.md$/, "")] = await sha256Hex(content);
+        hashes[pageName] = await sha256Hex(content);
+        const stat = await this.app.vault.adapter.stat(filePath);
+        if (stat) mtimes[pageName] = stat.mtime;
         written++;
         log.push(`PULL  ${name}`);
       } catch (entryErr) {
         log.push(`ERROR ${name}: ${(entryErr as Error).message}`);
       }
     }
-    // Seed the delta-push baseline so the next push only sends later edits.
+    // Seed the delta-push baseline so the next push only sends later edits,
+    // and the sync-mtime baseline so the next pull doesn't self-conflict on
+    // what this bootstrap just wrote.
     this.settings.contentHashCache = hashes;
+    this.settings.syncedMtimeCache = { ...(this.settings.syncedMtimeCache ?? {}), ...mtimes };
 
     const index = await this.listServerPageIndex(base, apiKey);
     const revisions: Record<string, string> = {};
